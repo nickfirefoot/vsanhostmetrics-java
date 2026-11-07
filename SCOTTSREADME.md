@@ -17,6 +17,8 @@ proof, this document says so rather than filling the gap.
 | ... from the live model (`app/perfsvc_model.py`) | 31 |
 | ... provisional / inferred (`app/perfsvc_model_extra.py`) | 38 |
 | entity types in `metric_tree.TREE` | 69 |
+| distinct groups in `TREE` (top-level names) | 24 (20) |
+| reserved groups with no source (`metric_tree.RESERVED`) | 2 |
 | ... targeting ClusterComputeResource / HostSystem / VirtualMachine | 16 / 47 / 6 |
 | (entity, metric) pairs modelled | 1636 |
 | ... of which `<name>Actual` twins dropped at collection | 41 |
@@ -28,7 +30,7 @@ proof, this document says so rather than filling the gap.
 ## Contents
 
 1. [Purpose and the 2.0.0 design](#1-purpose-and-the-200-design)
-2. [The SOAP path end to end](#2-the-soap-path-end-to-end)
+2. [The vSphere JSON API path end to end](#2-the-vsphere-json-api-path-end-to-end)
 3. [entityRefId grammar per entity type](#3-entityrefid-grammar-per-entity-type)
 4. [Ownership: which VMware object each entity lands on](#4-ownership-which-vmware-object-each-entity-lands-on)
 5. [The full cptvsan tree](#5-the-full-cptvsan-tree)
@@ -50,8 +52,17 @@ proof, this document says so rather than filling the gap.
   (`app/perfsvc_model*.py` `ENTITIES[...]["identity"]`).
 * **Target** -- the VMware-owned object a metric is written onto.
 * **Group** -- the `|`-separated path under `cptvsan` that `TREE` assigns.
-* **Instance** -- the `:<instance>` suffix on the last group level, for
-  entity types with more than one object per target (NICs, disks, CPUs ...).
+* **Instance** -- the `:<instance>` suffix on the last group level. It is
+  one of two things, told apart by whether the `TREE` template has a
+  placeholder:
+  * a **device** (`{vmnic}`, `{disk_uuid}`, `core-{cpu}` ...) -- more than one
+    object per target, one instance per NIC, disk, core, world, vSCSI device;
+  * a **variant** (`dom-owner`, `vsan`, `local` ...) -- a literal. Sibling
+    entity types were merged into one group and the variant names which one,
+    e.g. `Storage I/O:dom-client` and `Storage I/O:dom-owner`. There is exactly
+    one per target.
+  A device template may carry a variant prefix (`CPU:core-{cpu}` beside
+  `CPU:vsan`, `vSCSI:remote-{device}` beside `vSCSI:{device}`).
 * "**unit authority**" says WHICH source a unit came from (section 6).
   "derived from id" labels are a mechanical camelCase expansion of the metric
   id: they are not an authoritative meaning.
@@ -60,28 +71,35 @@ proof, this document says so rather than filling the gap.
 ### 2.0.0 in brief
 
 * The pack defines **no object kinds of its own** and **writes no
-  relationships**. `adapter.collect()` returns an empty `CollectResult` with
-  `update_relationships = NONE`, and `_assert_no_foreign_content` raises if any
-  object or relationship slipped in. (This is the repository's hard rule 1:
+  relationships**. `adapter.collect()` returns a `CollectResult` whose only
+  object is the adapter instance itself, carrying the `Collector|*`
+  self-metrics, with `update_relationships = NONE`;
+  `_assert_no_foreign_content` raises if any other object or any relationship
+  slipped in. (This is the repository's hard rule 1:
   relationship serialisation in the SDK is replace-not-merge, and the 1.x
   attach-to-vCenter design destroyed vCenter's own VM-to-host edges.)
 * Every metric is **pushed onto a VMware-owned object** that the built-in
   vSphere adapter (`VMWARE`) already collects -- `ClusterComputeResource`,
-  `HostSystem` or `VirtualMachine` -- through exactly two Suite API calls per
-  target per cycle (`app/push.py`):
+  `HostSystem` or `VirtualMachine` -- through the Suite API **batch** endpoints (`app/push.py`),
+  chunked by object count and bytes, several chunks in flight at once:
 
   ```
-  POST api/resources/{id}/stats       {"stat-content":     [{"statKey", "timestamps":[ts], "data":[v]}]}
-  POST api/resources/{id}/properties  {"property-content": [{"statKey", "timestamps":[ts], "values":[s]}]}
+  POST api/resources/stats
+  POST api/resources/properties
   ```
 
-  `_post` refuses any URL containing `adapterkinds` or `relationships` and any
-  key not under `cptvsan|`.
+  A chunk the server rejects is re-sent per resource
+  (`POST api/resources/{id}/stats` and `.../properties`). `_guard_url`
+  refuses any URL containing `adapterkinds` or `relationships`, and every key
+  must be under `cptvsan|`.
 * Operations resource ids are found by listing `VMWARE` resources of each kind
   (`GET api/resources?adapterKind=VMWARE&resourceKind=<kind>`, paged) and
   matching the pair (`VMEntityObjectID` = MoRef, `VMEntityVCID` = vCenter
-  `about.instanceUuid`). A pair held by two resources is ambiguous and is not
-  pushed to. Re-resolved every cycle.
+  `about.instanceUuid`). The ids are **cached** (`push.IdCache`): a full listing
+  only when an entry is older than `id_cache_ttl_minutes` (default 30) or after
+  a 404, one `recentlyAdded` delta listing per kind per cycle for a MoRef not
+  yet seen. A sample of pushed ids is re-read every cycle to catch a vanished
+  object.
 * **Prefix**: `cptvsan`.
 * **Key grammar** (`metric_tree.build_key`):
 
@@ -107,137 +125,78 @@ proof, this document says so rather than filling the gap.
   (`tools/build_view.py` puts the unit symbol into the column label). In the
   Operations metric picker a pushed key shows as its raw key path.
 
-## 2. The SOAP path end to end
+## 2. The vSphere JSON API path end to end
 
-The adapter itself speaks SOAP through pyVmomi plus the vendored vSAN bindings
-(`app/vendor/vsanmgmtObjects.py`, `vsanapiutils.py`). The same calls reproduced
-with plain HTTP are in `docs/soap/` (`01-login.xml`,
-`02-query-node-information.xml`, `03-query-perf.xml`, `README.md`).
+Since 2.0.0 the adapter speaks only the vSphere JSON API (vCenter 8.0 Update 3
+or later, or 9.0 or later): `app/vcenter.py`, plain HTTPS with `requests`, no
+SOAP library. Request and response shapes follow the MIT-licensed reference
+pack vcf-content-factory-sdk-vsanperf (Scott Bowe), see NOTICE. One collect is
+`app/collector.py` `run_collection`.
 
-### 2.1 Calls per collection cycle (`app/adapter.py` `_collect_and_push`)
+### 2.1 Calls per collection cycle
 
-| # | Endpoint | Call | Purpose | Code |
-|---|---|---|---|---|
-| 1 | `POST /sdk` (`SOAPAction: urn:vim25/8.0`) | `Login` on `SessionManager` | Session. The `vmware_soap_session` **cookie** is the only accepted proof of session (basic auth faults `NotAuthenticated`; the `<key>` in the response body is not the cookie). | `perfsvc.connect` -> `SmartConnect` |
-| 2 | `/sdk` | `RetrieveServiceContent` | `content.about.instanceUuid` = the `VMEntityVCID` every target is matched on. Empty -> nothing can be pushed (raised as an error). | `si.RetrieveContent()` |
-| 3 | `/sdk` | PropertyCollector reads (implicit) | Walk `rootFolder` -> Datacenter -> `hostFolder` for every ClusterComputeResource; read `configurationEx.vsanConfigInfo.defaultConfig.uuid`, `cluster.host`, `host.configManager.vsanSystem.config.clusterInfo.nodeUuid`, `host.config.storageDevice`. pyVmomi turns each managed-object attribute read into a PropertyCollector retrieval; the pack builds no filter specs itself. | `connect`, `build_parent_map`, `build_name_map`, `build_disk_hardware` |
-| 4 | `/sdk` | `CreateContainerView(rootFolder, [VirtualMachine], recursive)` | Every VM's `config.uuid`, `config.instanceUuid`, name and VirtualDisk `backing.fileName` | `build_parent_map`, `build_name_map` |
-| 5 | `/sdk` | `HostVsanSystem.QueryDisksForVsan()` per host | disk `vsanUuid` -> owning host; disk model/vendor/firmware | `build_parent_map`, `build_disk_hardware` |
-| 6 | `POST /vsanHealth` (`SOAPAction: urn:vsan/8.0`, same cookie) | `VsanPerfQueryNodeInformation(cluster)` | `vsanNodeUuid` + `hostname` per node: names, and the host-join fallback | `build_name_map`, `build_parent_map` |
-| 7 | `/vsanHealth` | `QueryVsanManagedDisks(host)` (vsan-disk-management-system) | ESA storage-pool disks: `vsanUuid` -> host, display name | `build_parent_map`, `build_name_map` |
-| 8 | `/vsanHealth` | `VsanQueryVcClusterHealthSummary(fields=["hclInfo"])` | controller driver versions (read-only) | `build_disk_hardware` |
-| 9 | `/vsanHealth` | `VsanPerfQueryPerf([spec], cluster)` -- **one call per entity type per cluster** | the metrics | `perfsvc.collect` |
-| 10 | Suite API | `GET api/resources` per kind, paged; `POST .../stats`, `POST .../properties` per target | resolve and push | `push.index`, `push.push` |
+| # | Endpoint (`/sdk/vim25/8.0.3.0/...`) | Purpose | Code |
+|---|---|---|---|
+| 1 | `GET SessionManager/SessionManager/currentSession` (saved `vmware-api-session-id`); `POST .../Login` only when that is empty | One session REUSED across collect processes (its id is kept in the state file, 0600). | `vcenter.VcClient` |
+| 2 | `GET ServiceInstance/ServiceInstance/content` | `about.instanceUuid` = `VMEntityVCID`; `about.version`/`build` = the support floor (Test Connection fails below 8.0 U3). | `VcClient.check_version` |
+| 3 | `POST PropertyCollector/<own pc>/WaitForUpdatesEx` | Inventory (clusters, hosts, VMs) from a session-lived filter: only CHANGES after the first cycle. A full read on first run, new session, fault, or hourly. | `inventory.InventoryTracker` |
+| 4 | `POST HostVsanSystem/<id>/QueryDisksForVsan`, `vsan/.../QueryVsanManagedDisks`, `RetrievePropertiesEx` (storage), `vsan/.../VsanQueryVcClusterHealthSummary` | Disk -> host, disk names and hardware. Cached for an hour per cluster. | `perfsvc.disk_inventory` |
+| 5 | `POST vsan/VsanPerformanceManager/vsan-performance-manager/VsanPerfQueryPerf` | **One call per entity type per cluster** (vSAN refuses two wildcard specs in one call: `...queryperf.wildcardlimit`), with the `labels` filter, gzip. HEAVY types (`app/cadence.py`) every 3rd cycle. | `vcenter.query_cluster` |
+| 6 | Suite API `GET api/resources` (TTL 30 min, `recentlyAdded` delta on a miss); `POST api/resources/stats` and `.../properties` (batch) | Resolve and push. | `push.IdCache`, `push.BatchPusher` |
 
 ### 2.2 `VsanPerfQueryPerf` request
 
-`VsanPerfQuerySpec` fields (vendored binding): `entityRefId` (required),
-`startTime`, `endTime`, `group`, `labels[]`, `interval`. The pack sets only
-the first three:
-
-```xml
-<VsanPerfQueryPerf xmlns="urn:vsan">
-  <_this type="VsanPerformanceManager">vsan-performance-manager</_this>
-  <querySpecs>
-    <entityRefId>vsan-pnic-net:*</entityRefId>   <!-- "<entity type>:*" = every object of the type -->
-    <startTime>${startTime}</startTime>
-    <endTime>${endTime}</endTime>
-  </querySpecs>
-  <cluster type="ClusterComputeResource">domain-c1</cluster>
-</VsanPerfQueryPerf>
+```json
+{"querySpecs": [{"_typeName": "VsanPerfQuerySpec", "entityRefId": "vsan-pnic-net:*",
+                 "startTime": "2026-11-07T02:15:00Z", "endTime": "2026-11-07T02:30:00Z",
+                 "labels": ["rxCrcErr", "rxMissErr", "..."]}],
+ "cluster": {"_typeName": "ManagedObjectReference", "type": "ClusterComputeResource",
+             "value": "domain-c1"}}
 ```
 
-* **Window.** `perfsvc.collect(window_minutes=15)`: `startTime = now - 15 min`,
-  `endTime = now`, and the **last parseable value** of each series is kept.
-  The Performance Service buckets on 5-minute boundaries, so a 15-minute
-  window returns several samples per metric. `docs/soap/README.md` records
-  that a window **shorter than 5 minutes returns exactly one sample per
-  metric** (measured: 30 min -> 7 samples, 6 min -> 2, 4 min -> 1, 1 min -> 1),
-  which is the trick a no-code tool would use. The Python adapter does not
-  rely on it; it takes the last sample of a 15-minute window instead, because
-  the 5-minute buckets do not line up with the Operations collection cycle.
-* Wildcard queries are capped at one hour by the service (a longer range
-  faults); 15 minutes is inside that.
-* `labels[]` (server-side metric filtering) is **not used**: every metric of
-  the entity type comes back.
-* `InvalidArgument` / `NotSupported` from a query mean "this entity type is
-  not available here" and are summarised in one line, not raised.
+* **Window.** From the newest sample already pushed for that (cluster, type)
+  to now: about 5 minutes for CORE types, 15 for HEAVY, at most 60 after an
+  outage (`cadence.window`). Every sample in it is pushed with its own
+  `sampleInfo` timestamp; a sample at or before the last pushed one is skipped.
+* `InvalidArgument` naming the entity type, or `NotSupported`, means "not
+  available on this cluster": remembered for 6 hours, summarised once.
 
 ### 2.3 `VsanPerfQueryPerf` response, exactly as consumed
 
-The return type is `VsanPerfEntityMetricCSV[]` -- one element per OBJECT of
-the queried type:
+A JSON array of `VsanPerfEntityMetricCSV`, one per object of the type:
 
-| Type.field | Type | Used by the code |
-|---|---|---|
-| `VsanPerfEntityMetricCSV.entityRefId` | string | **Yes.** Parsed into the entity type + identity parts (section 3). A ref containing `*` is the query echoed back for an empty type and is skipped. |
-| `VsanPerfEntityMetricCSV.sampleInfo` | string (CSV, one entry per sample) | No. Timestamps are not read; the push uses the adapter's own collection time. |
-| `VsanPerfEntityMetricCSV.value[]` | `VsanPerfMetricSeriesCSV[]` | **Yes**, one per metric |
-| `VsanPerfMetricSeriesCSV.metricId` | `VsanPerfMetricId` | **Yes** |
-| `VsanPerfMetricId.label` | string | **Yes** -- the metric id, used verbatim as the last key segment |
-| `VsanPerfMetricId.group`, `.rollupType`, `.statsType`, `.name`, `.description`, `.metricsCollectInterval` | optional | No |
-| `VsanPerfMetricSeriesCSV.values` | string (CSV) | **Yes** -- the last parseable number is kept (`_last_number`) |
-| `VsanPerfMetricSeriesCSV.threshold`, `.numExceptions` | optional | No |
+| Field | Used by the code |
+|---|---|
+| `entityRefId` | **Yes.** Entity type + identity parts (section 3). A ref containing `*` is the query echoed back for an empty type and is skipped. |
+| `sampleInfo` | **Yes.** CSV of UTC `YYYY-MM-DD HH:MM:SS`, one per sample; each value is pushed at its own timestamp. |
+| `value[].metricId.label` | **Yes** -- the metric id, the last key segment |
+| `value[].values` | **Yes** -- CSV aligned with `sampleInfo`; `None` = no sample (absent, never zero) |
 
-Trimmed, illustrative response (placeholder UUIDs; element layout follows the
-binding types above; the `sampleInfo` timestamp format is not recorded in this
-repository and is shown schematically):
+### 2.4 From response to rows (`perfsvc.RowSink` -> `push.plan`)
 
-```xml
-<VsanPerfQueryPerfResponse xmlns="urn:vsan">
-  <returnval>
-    <entityRefId>vsan-pnic-net:6a000000-0000-0000-0000-0000000000a1|vmnic0</entityRefId>
-    <sampleInfo>T1,T2,T3</sampleInfo>
-    <value>
-      <metricId><label>rxMissErr</label><group>...</group></metricId>
-      <values>0,0,2</values>
-    </value>
-    <value>
-      <metricId><label>rxPktRaw</label><group>...</group></metricId>
-      <values>347383079,347501230,347611004</values>
-    </value>
-  </returnval>
-  <returnval>
-    <entityRefId>vsan-pnic-net:6a000000-0000-0000-0000-0000000000a1|vmnic1</entityRefId>
-    ...
-  </returnval>
-</VsanPerfQueryPerfResponse>
-```
-
-### 2.4 From response to rows (`perfsvc.collect` -> `push.plan`)
-
-1. For each `returnval`: skip if `entityRefId` contains `*`; `parse_ref` splits
-   it on the FIRST `:` into entity type and tail, then the tail on `|` into
-   identity parts named by `ENTITIES[type]["identity"]`. Missing trailing parts
-   are filled with `(all)` (host-cpu returns both `host-cpu:<host>` and
-   `host-cpu:<host>|cpu-8`); surplus parts are kept as `part<i>`. An unmodelled
-   entity type is reported as a problem.
-2. The parsed `ObjectKey(entity, idents)` is the row identity. Objects from
-   every cluster's queries are merged into ONE dict (`objects.update`), so a
-   ref returned by two clusters' queries keeps the later one.
-3. For each `value`: skip an empty label or empty `values`; skip
-   `<name>Actual` when `<name>` is also modelled (identical twin); keep the
-   last number of the CSV; divide by 10 if the metric id is in
-   `perfsvc.PERMILLE` (per-mille -> percent).
-4. `push.plan`: resolve the object's MoRef (section 4); build every key with
-   `metric_tree.build_key`; add derived metrics; add `name` (readable label for
-   a `disk_uuid` / `vdisk_uuid` instance) and disk-hardware properties
-   (`firmware`, `model`, `vendor`, `driver`, `driver_version`) for
-   `vsan-esa-disk-layer`, `vsan-esa-disk-scsifw`, `cache-disk`, `capacity-disk`. A key written by two
-   different objects onto the same target is counted as a collision; the
-   later write wins.
-5. `push.push`: one stats POST and one properties POST per resolved target,
-   all values stamped with the same timestamp.
+1. `parse_ref` splits the ref into entity type and identity parts. Missing
+   trailing parts are filled with `(all)` (host-cpu's per-host aggregate
+   becomes the instance `CPU:cores-total`); surplus parts are kept as `part<i>`.
+2. Per series: skip `<name>Actual` twins; keep every numeric sample newer than
+   the last pushed one; divide by 10 if the id is in `perfsvc.PERMILLE`.
+3. `push.plan`: resolve the MoRef (section 4); build keys with
+   `metric_tree.build_key`; derived metrics per sample timestamp; `name` and
+   disk-hardware properties for `vsan-esa-disk-layer`, `vsan-esa-disk-scsifw`, `cache-disk`, `capacity-disk`.
+   Objects are visited in a fixed order; when two entity TYPES write the same
+   key on one disk the first type's series is kept (disk guard).
+4. `push.BatchPusher`: chunks of up to 100 objects / 1 MB, several in flight;
+   a rejected chunk is re-sent per resource; ids that vanished are caught by a
+   per-cycle verification sample.
 
 ### 2.5 Derived metrics (`app/push.py`)
 
-Computed from the same object in the same cycle, never zero-filled (skipped if
-an input is missing or the denominator is zero):
+Computed from the same object at the same sample timestamp, never zero-filled
+(skipped if an input is missing or the denominator is zero):
 
 | Key | Entity | Formula | Unit | Note |
 |---|---|---|---|---|
 | `cptvsan\|Network\|Physical NIC:{vmnic}\|rxLossRatio` | `vsan-pnic-net` | 100 x `rxMissErrRaw` / `rxPktRaw` | percent (by construction) | LIFETIME missed-packet share: both inputs are since-boot counters. The obvious `rxMissErr / rxPackets` was rejected because `rxMissErr` is already a ratio. |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedLowBandPct` | `host-domowner` | 100 x `numNetSchedLowBandSec` / (low + mid + high) | percent (by construction) | `numNetSchedHighBandSec` optional. None of the three inputs has a unit or a schema description in the repo's sources. |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedLowBandPct` | `host-domowner` | 100 x `numNetSchedLowBandSec` / (low + mid + high) | percent (by construction) | `numNetSchedHighBandSec` optional. None of the three inputs has a unit or a schema description in the repo's sources. |
 
 ## 3. entityRefId grammar per entity type
 
@@ -363,27 +322,33 @@ this adapter instance connects to**.
 vCenter (VMEntityVCID = about.instanceUuid)
  |
  +-- ClusterComputeResource  <- cluster_uuid (vsanConfigInfo.defaultConfig.uuid)
- |     cptvsan|Capacity, Storage I/O|DOM *, Resync, Network|RDT|Cluster Latency,
- |     zDOM|Top Stats, ESA Dedup|*, Services|PMEM, Services|Data Protection,
- |     Storage I/O|Remote DOM Client[ (Compute)]
+ |     cptvsan|Capacity, Resync, Network|RDT, zDOM, PMEM, Data Protection,
+ |     Storage I/O:<dom-client|dom-owner|dom-compmgr|remote-dom-client|
+ |                  remote-dom-client-compute>,
+ |     ESA Dedup:<dom-client-io|dom-owner-io|dom-compmgr-io|chunk-service|hash-service>
  |
  +-- HostSystem              <- host_uuid (vsanSystem...clusterInfo.nodeUuid)
  |     |                     <- disk_uuid (owning host of the disk)
  |     +-- per pNIC          Network|Physical NIC:<vmnic>
- |     +-- per vmknic        Network|VMkernel NIC:<vmk>, Network|RDT|VMkernel Latency:<vmk>
+ |     +-- per vmknic        Network|VMkernel NIC:<vmk>   (vmknic stats + per-vmk RDT latency)
  |     +-- per TCP/IP stack  Network|TCP/IP Stack:<stack>
- |     +-- per disk          Disks|ESA Disk:<disk_uuid>, Disks|OSA|*:<disk_uuid>,
- |     |                     Disks|Health:<disk_uuid>, Placement|CLOM Disk:<disk_uuid>
- |     +-- per CPU / world   CPU|Core:<cpu>|(all), CPU|DOM World:<name-id>, CPU|LSOM World:<name-id>
- |     +-- per heap / slab   Memory|Heap:<heap>, Memory|Slab:<slab>
- |     +-- per iSCSI         Services|iSCSI|Target:<target>, Services|iSCSI|LUN:<target-lun>
- |     +-- host-wide groups  Storage I/O|*, Network|Host/CMMDS/RDT, CPU|vSAN, Memory|*, ...
+ |     +-- per disk          Disk:<disk_uuid>   (ESA layer, ESA SCSI/firmware, OSA cache,
+ |     |                                         OSA capacity, DDH, CLOM disk)
+ |     |                     Disk Group:<disk_uuid>
+ |     +-- CPU               CPU:vsan, CPU:core-<cpu>, CPU:dom-<world>-<id>, CPU:lsom-<world>-<id>
+ |     +-- Memory            Memory:vsan, Memory:system, Memory:heap-<heap>, Memory:slab-<slab>
+ |     +-- iSCSI             iSCSI:host, iSCSI:target-<target>, iSCSI:lun-<target>-<lun>
+ |     +-- variants          Storage I/O:<dom-client|dom-owner|dom-compmgr|remote-dom-client|
+ |     |                                  remote-dom-client-compute|vsansparse>,
+ |     |                     ESA Dedup:<component>, vSAN Direct:<host|cluster>
+ |     +-- host-wide groups  Network|Host (host net + CMMDS + RDT net + RDT latency),
+ |                           zDOM (top stats + VTX), Placement, PMEM, File Service, IOInsight
  |
  +-- VirtualMachine          <- vm_uuid (config.uuid or config.instanceUuid)
        |                     <- vdisk path (VirtualDisk backing.fileName)
-       +-- VM, VM (Remote)                    (one per VM)
-       +-- per virtual disk  Virtual Disk:<path>, Virtual Disk (Remote):<path>
-       +-- per vSCSI device  vSCSI:<device>, vSCSI (Remote):<device>
+       +-- VM:local, VM:remote                    (one each per VM)
+       +-- per virtual disk  Virtual Disk:<path>, Virtual Disk:remote-<path>
+       +-- per vSCSI device  vSCSI:<device>, vSCSI:remote-<device>
 ```
 
 Note there is **no relationship** behind this diagram that the pack creates:
@@ -394,75 +359,75 @@ is not an object; it is an instance on its host's metric keys.
 
 | Entity type | Target kind | Resolved by | Instance template | Instance dimension | Notes |
 |---|---|---|---|---|---|
-| `vsan-cluster-capacity` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
-| `cluster-domclient` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
-| `cluster-domowner` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
-| `cluster-domcompmgr` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
-| `cluster-remotedomclient` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
-| `computeCluster-remotedomclient` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
-| `cluster-resync` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
-| `cluster-rdt-network-latency` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
-| `cluster-zdom-top-stats` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
-| `cluster-esa-dedup-domclient-io` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
-| `cluster-esa-dedup-domowner-io` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
-| `cluster-esa-dedup-domcompmgr-io` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
-| `cluster-esa-dedup-store-chunksvc` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
-| `cluster-esa-dedup-store-hashsvc` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
+| `cluster-domclient` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `dom-client` | fixed variant (one per target) |  |
+| `cluster-domcompmgr` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `dom-compmgr` | fixed variant (one per target) |  |
+| `cluster-domowner` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `dom-owner` | fixed variant (one per target) |  |
+| `cluster-esa-dedup-domclient-io` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `dom-client-io` | fixed variant (one per target) | identity inferred |
+| `cluster-esa-dedup-domcompmgr-io` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `dom-compmgr-io` | fixed variant (one per target) | identity inferred |
+| `cluster-esa-dedup-domowner-io` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `dom-owner-io` | fixed variant (one per target) | identity inferred |
+| `cluster-esa-dedup-store-chunksvc` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `chunk-service` | fixed variant (one per target) | identity inferred |
+| `cluster-esa-dedup-store-hashsvc` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `hash-service` | fixed variant (one per target) | identity inferred |
 | `cluster-pmem` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
+| `cluster-rdt-network-latency` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
+| `cluster-remotedomclient` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `remote-dom-client` | fixed variant (one per target) | identity inferred |
+| `cluster-resync` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - | identity inferred |
+| `cluster-zdom-top-stats` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
+| `computeCluster-remotedomclient` | ClusterComputeResource | `cluster_uuid` -> `clusters` | `remote-dom-client-compute` | fixed variant (one per target) | identity inferred |
+| `vsan-cluster-capacity` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
 | `vsan-dp-historical-stats` | ClusterComputeResource | `cluster_uuid` -> `clusters` | - | - |  |
-| `vsan-pnic-net` | HostSystem | `host_uuid` -> `hosts` | `{vmnic}` | physical NIC (vmnic name) |  |
-| `vsan-vnic-net` | HostSystem | `host_uuid` -> `hosts` | `{vmknic}` | VMkernel NIC (vmk name) | `stack` part is NOT in the instance |
-| `vsan-tcpip-stats` | HostSystem | `host_uuid` -> `hosts` | `{stack}` | TCP/IP stack name |  |
-| `rdt-network-latency` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `vnic-rdt-network-latency` | HostSystem | `host_uuid` -> `hosts` | `{vmknic}` | VMkernel NIC (vmk name) |  |
-| `rdt-net` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `cmmds-net` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `vsan-host-net` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `host-domclient` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `host-domowner` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `host-domcompmgr` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `host-remotedomclient` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `computeHost-remotedomclient` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `host-vsansparse` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `vsan-esa-disk-layer` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) |  |
-| `vsan-esa-disk-scsifw` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) |  |
 | `cache-disk` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) | identity inferred |
 | `capacity-disk` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) | identity inferred |
-| `disk-group` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) | identity inferred; keyed by an inferred `disk_uuid`; which disk identifies a group is unrecorded |
-| `ddh-disk` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) | identity inferred |
-| `zdom-vtx` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `host-zdom-top-stats` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `vsan-cpu` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `host-cpu` | HostSystem | `host_uuid` -> `hosts` | `{cpu}` | physical CPU id, or `(all)` for the per-host aggregate |  |
-| `dom-world-cpu` | HostSystem | `host_uuid` -> `hosts` | `{world_name}-{world_id}` | ESXi world name + id |  |
-| `lsom-world-cpu` | HostSystem | `host_uuid` -> `hosts` | `{world_name}-{world_id}` | ESXi world name + id | identity inferred |
-| `vsan-memory` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `system-mem` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
-| `heap-memory` | HostSystem | `host_uuid` -> `hosts` | `{heap_name}` | heap name | identity inferred |
-| `slab-memory` | HostSystem | `host_uuid` -> `hosts` | `{slab_name}` | slab name | identity inferred |
-| `clom-host` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
 | `clom-disk` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) | identity inferred |
+| `clom-host` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
+| `cmmds-net` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
 | `cmmds-workload` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `vsan-distribution` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `host-esa-dedup-domclient-io` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `host-esa-dedup-domowner-io` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `host-esa-dedup-domcompmgr-io` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `host-esa-dedup-store-chunksvc` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `host-esa-dedup-store-hashsvc` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
+| `computeHost-remotedomclient` | HostSystem | `host_uuid` -> `hosts` | `remote-dom-client-compute` | fixed variant (one per target) | identity inferred |
+| `ddh-disk` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) | identity inferred |
+| `disk-group` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) | identity inferred; keyed by an inferred `disk_uuid`; which disk identifies a group is unrecorded |
+| `dom-world-cpu` | HostSystem | `host_uuid` -> `hosts` | `dom-{world_name}-{world_id}` | ESXi world name + id, prefixed `dom-` |  |
+| `heap-memory` | HostSystem | `host_uuid` -> `hosts` | `heap-{heap_name}` | heap name, prefixed `heap-` | identity inferred |
+| `host-cpu` | HostSystem | `host_uuid` -> `hosts` | `core-{cpu}` | physical CPU id, or `(all)` for the per-host aggregate, prefixed `core-` |  |
+| `host-domclient` | HostSystem | `host_uuid` -> `hosts` | `dom-client` | fixed variant (one per target) |  |
+| `host-domcompmgr` | HostSystem | `host_uuid` -> `hosts` | `dom-compmgr` | fixed variant (one per target) |  |
+| `host-domowner` | HostSystem | `host_uuid` -> `hosts` | `dom-owner` | fixed variant (one per target) |  |
+| `host-esa-dedup-domclient-io` | HostSystem | `host_uuid` -> `hosts` | `dom-client-io` | fixed variant (one per target) | identity inferred |
+| `host-esa-dedup-domcompmgr-io` | HostSystem | `host_uuid` -> `hosts` | `dom-compmgr-io` | fixed variant (one per target) | identity inferred |
+| `host-esa-dedup-domowner-io` | HostSystem | `host_uuid` -> `hosts` | `dom-owner-io` | fixed variant (one per target) | identity inferred |
+| `host-esa-dedup-store-chunksvc` | HostSystem | `host_uuid` -> `hosts` | `chunk-service` | fixed variant (one per target) | identity inferred |
+| `host-esa-dedup-store-hashsvc` | HostSystem | `host_uuid` -> `hosts` | `hash-service` | fixed variant (one per target) | identity inferred |
 | `host-pmem` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `vsan-iscsi-host` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `vsan-iscsi-target` | HostSystem | `host_uuid` -> `hosts` | `{target}` | iSCSI target | identity inferred |
-| `vsan-iscsi-lun` | HostSystem | `host_uuid` -> `hosts` | `{target}-{lun}` | iSCSI target + LUN | identity inferred |
-| `vsan-file-service` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `vsan-direct-host` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `vsan-direct-cluster` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred; cluster-sounding name, inferred `host_uuid`, lands on a host |
+| `host-remotedomclient` | HostSystem | `host_uuid` -> `hosts` | `remote-dom-client` | fixed variant (one per target) | identity inferred |
+| `host-vsansparse` | HostSystem | `host_uuid` -> `hosts` | `vsansparse` | fixed variant (one per target) |  |
+| `host-zdom-top-stats` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
 | `ioinsight` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
-| `virtual-machine` | VirtualMachine | `vm_uuid` -> `vms` | - | - |  |
-| `remote-virtual-machine` | VirtualMachine | `vm_uuid` -> `vms` | - | - | identity inferred |
+| `lsom-world-cpu` | HostSystem | `host_uuid` -> `hosts` | `lsom-{world_name}-{world_id}` | ESXi world name + id, prefixed `lsom-` | identity inferred |
+| `rdt-net` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
+| `rdt-network-latency` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
+| `slab-memory` | HostSystem | `host_uuid` -> `hosts` | `slab-{slab_name}` | slab name, prefixed `slab-` | identity inferred |
+| `system-mem` | HostSystem | `host_uuid` -> `hosts` | `system` | fixed variant (one per target) |  |
+| `vnic-rdt-network-latency` | HostSystem | `host_uuid` -> `hosts` | `{vmknic}` | VMkernel NIC (vmk name) |  |
+| `vsan-cpu` | HostSystem | `host_uuid` -> `hosts` | `vsan` | fixed variant (one per target) |  |
+| `vsan-direct-cluster` | HostSystem | `host_uuid` -> `hosts` | `cluster` | fixed variant (one per target) | identity inferred; cluster-sounding name, inferred `host_uuid`, lands on a host |
+| `vsan-direct-host` | HostSystem | `host_uuid` -> `hosts` | `host` | fixed variant (one per target) | identity inferred |
+| `vsan-distribution` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
+| `vsan-esa-disk-layer` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) |  |
+| `vsan-esa-disk-scsifw` | HostSystem | `disk_uuid` -> `disks` | `{disk_uuid}` | vSAN disk uuid (opaque) |  |
+| `vsan-file-service` | HostSystem | `host_uuid` -> `hosts` | - | - | identity inferred |
+| `vsan-host-net` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
+| `vsan-iscsi-host` | HostSystem | `host_uuid` -> `hosts` | `host` | fixed variant (one per target) | identity inferred |
+| `vsan-iscsi-lun` | HostSystem | `host_uuid` -> `hosts` | `lun-{target}-{lun}` | iSCSI target + LUN, prefixed `lun-` | identity inferred |
+| `vsan-iscsi-target` | HostSystem | `host_uuid` -> `hosts` | `target-{target}` | iSCSI target, prefixed `target-` | identity inferred |
+| `vsan-memory` | HostSystem | `host_uuid` -> `hosts` | `vsan` | fixed variant (one per target) |  |
+| `vsan-pnic-net` | HostSystem | `host_uuid` -> `hosts` | `{vmnic}` | physical NIC (vmnic name) |  |
+| `vsan-tcpip-stats` | HostSystem | `host_uuid` -> `hosts` | `{stack}` | TCP/IP stack name |  |
+| `vsan-vnic-net` | HostSystem | `host_uuid` -> `hosts` | `{vmknic}` | VMkernel NIC (vmk name) | `stack` part is NOT in the instance |
+| `zdom-vtx` | HostSystem | `host_uuid` -> `hosts` | - | - |  |
+| `remote-virtual-disk` | VirtualMachine | `disk_uuid` -> `vdisks` | `remote-{disk_uuid}` | virtual disk path (inferred; part is named `disk_uuid`), prefixed `remote-` | identity inferred; its `disk_uuid` is resolved as a VIRTUAL-disk path (vdisks map) |
+| `remote-virtual-machine` | VirtualMachine | `vm_uuid` -> `vms` | `remote` | fixed variant (one per target) | identity inferred |
+| `remote-vscsi` | VirtualMachine | `vm_uuid` -> `vms` | `remote-{device}` | vSCSI device id, prefixed `remote-` | identity inferred |
 | `virtual-disk` | VirtualMachine | `vdisk_uuid` -> `vdisks` | `{vdisk_uuid}` | virtual disk datastore path `<namespace-uuid>/<file>.vmdk` |  |
-| `remote-virtual-disk` | VirtualMachine | `disk_uuid` -> `vdisks` | `{disk_uuid}` | virtual disk path (inferred; part is named `disk_uuid`) | identity inferred; its `disk_uuid` is resolved as a VIRTUAL-disk path (vdisks map) |
+| `virtual-machine` | VirtualMachine | `vm_uuid` -> `vms` | `local` | fixed variant (one per target) |  |
 | `vscsi` | VirtualMachine | `vm_uuid` -> `vms` | `{device}` | vSCSI device id |  |
-| `remote-vscsi` | VirtualMachine | `vm_uuid` -> `vms` | `{device}` | vSCSI device id | identity inferred |
 
 ### 4.4 External / remote clusters (vSAN HCI Mesh, compute-only clusters)
 
@@ -493,8 +458,9 @@ Consequences worth stating plainly:
   results by `ObjectKey`. If the server cluster and the client cluster's
   queries both return the same ref, the later silently replaces the earlier
   before `plan` (this merge is not counted as a collision).
-* **Remote and local are separate groups** (`VM` vs `VM (Remote)`, `Storage
-  I/O|DOM Client` vs `Storage I/O|Remote DOM Client`). Whether `virtual-machine`
+* **Remote and local share a group and differ by instance** (`VM:local` vs
+  `VM:remote`, `Storage I/O:dom-client` vs `Storage I/O:remote-dom-client`,
+  `vSCSI:<device>` vs `vSCSI:remote-<device>`). Whether `virtual-machine`
   ALSO includes a VM's remote IO (i.e. whether local + remote double-counts)
   is not established by any source here.
 * Other "cluster" names that land on hosts: `vsan-direct-cluster`
@@ -504,34 +470,31 @@ Consequences worth stating plainly:
 
 ## 5. The full cptvsan tree
 
-Generated from `metric_tree.TREE`. `:{...}` marks an instanced level (one instance per value). Metric counts are pushed metrics (after dropping `Actual` twins) plus derived. `[P]` = property (string), not a metric.
+Generated from `metric_tree.TREE`. A group with instances lists each instance template on its own line: `:{...}` is a DEVICE (one instance per value), a bare `:name` is a VARIANT (one per target; section 1). Metric counts are pushed metrics (after dropping `Actual` twins) plus derived. `[P]` = property (string), not a metric.
 
 ### Cluster (ClusterComputeResource)
 
 ```
 cptvsan
   +-- Capacity    <- vsan-cluster-capacity (6)
+  +-- Data Protection    <- vsan-dp-historical-stats (1)
   +-- ESA Dedup
-    +-- Chunk Service    <- cluster-esa-dedup-store-chunksvc (27)
-    +-- DOM Client I/O    <- cluster-esa-dedup-domclient-io (24)
-    +-- DOM Component Manager I/O    <- cluster-esa-dedup-domcompmgr-io (24)
-    +-- DOM Owner I/O    <- cluster-esa-dedup-domowner-io (24)
-    +-- Hash Service    <- cluster-esa-dedup-store-hashsvc (34)
+    :chunk-service    <- cluster-esa-dedup-store-chunksvc (27)
+    :dom-client-io    <- cluster-esa-dedup-domclient-io (24)
+    :dom-compmgr-io    <- cluster-esa-dedup-domcompmgr-io (24)
+    :dom-owner-io    <- cluster-esa-dedup-domowner-io (24)
+    :hash-service    <- cluster-esa-dedup-store-hashsvc (34)
   +-- Network
-    +-- RDT
-      +-- Cluster Latency    <- cluster-rdt-network-latency (17)
+    +-- RDT    <- cluster-rdt-network-latency (17)
+  +-- PMEM    <- cluster-pmem (8)
   +-- Resync    <- cluster-resync (24)
-  +-- Services
-    +-- Data Protection    <- vsan-dp-historical-stats (1)
-    +-- PMEM    <- cluster-pmem (8)
   +-- Storage I/O
-    +-- DOM Client    <- cluster-domclient (14)
-    +-- DOM Component Manager    <- cluster-domcompmgr (15)
-    +-- DOM Owner    <- cluster-domowner (46)
-    +-- Remote DOM Client    <- cluster-remotedomclient (8)
-    +-- Remote DOM Client (Compute)    <- computeCluster-remotedomclient (8)
-  +-- zDOM
-    +-- Top Stats    <- cluster-zdom-top-stats (12)
+    :dom-client    <- cluster-domclient (14)
+    :dom-compmgr    <- cluster-domcompmgr (15)
+    :dom-owner    <- cluster-domowner (46)
+    :remote-dom-client    <- cluster-remotedomclient (8)
+    :remote-dom-client-compute    <- computeCluster-remotedomclient (8)
+  +-- zDOM    <- cluster-zdom-top-stats (12)
   +-- Collector
     [P] lastUpdated
 ```
@@ -541,84 +504,59 @@ cptvsan
 ```
 cptvsan
   +-- CPU
-    +-- Core:{cpu}    <- host-cpu (3)
-    +-- DOM World:{world_name}-{world_id}    <- dom-world-cpu (3)
-    +-- LSOM World:{world_name}-{world_id}    <- lsom-world-cpu (2)
-    +-- vSAN    <- vsan-cpu (7)
-  +-- Disks
-    +-- ESA Disk:{disk_uuid}    <- vsan-esa-disk-layer (38), vsan-esa-disk-scsifw (16)
-      [P] name
-      [P] firmware
-      [P] model
-      [P] vendor
-      [P] driver
-      [P] driver_version
-    +-- Health:{disk_uuid}    <- ddh-disk (10)
-      [P] name
-    +-- OSA
-      +-- Cache Disk:{disk_uuid}    <- cache-disk (8)
-        [P] name
-        [P] firmware
-        [P] model
-        [P] vendor
-        [P] driver
-        [P] driver_version
-      +-- Capacity Disk:{disk_uuid}    <- capacity-disk (13)
-        [P] name
-        [P] firmware
-        [P] model
-        [P] vendor
-        [P] driver
-        [P] driver_version
-      +-- Disk Group:{disk_uuid}    <- disk-group (38)
-        [P] name
+    :core-{cpu}    <- host-cpu (3)
+    :dom-{world_name}-{world_id}    <- dom-world-cpu (3)
+    :lsom-{world_name}-{world_id}    <- lsom-world-cpu (2)
+    :vsan    <- vsan-cpu (7)
+  +-- Disk
+    :{disk_uuid}    <- cache-disk (8), capacity-disk (13), clom-disk (3), ddh-disk (10), vsan-esa-disk-layer (38), vsan-esa-disk-scsifw (16)
+    [P] name
+    [P] firmware
+    [P] model
+    [P] vendor
+    [P] driver
+    [P] driver_version
+  +-- Disk Group
+    :{disk_uuid}    <- disk-group (38)
+    [P] name
   +-- ESA Dedup
-    +-- Chunk Service    <- host-esa-dedup-store-chunksvc (27)
-    +-- DOM Client I/O    <- host-esa-dedup-domclient-io (24)
-    +-- DOM Component Manager I/O    <- host-esa-dedup-domcompmgr-io (24)
-    +-- DOM Owner I/O    <- host-esa-dedup-domowner-io (24)
-    +-- Hash Service    <- host-esa-dedup-store-hashsvc (34)
+    :chunk-service    <- host-esa-dedup-store-chunksvc (27)
+    :dom-client-io    <- host-esa-dedup-domclient-io (24)
+    :dom-compmgr-io    <- host-esa-dedup-domcompmgr-io (24)
+    :dom-owner-io    <- host-esa-dedup-domowner-io (24)
+    :hash-service    <- host-esa-dedup-store-hashsvc (34)
+  +-- File Service    <- vsan-file-service (8)
+  +-- IOInsight    <- ioinsight (82)
   +-- Memory
-    +-- Heap:{heap_name}    <- heap-memory (1)
-    +-- Slab:{slab_name}    <- slab-memory (1)
-    +-- System    <- system-mem (3)
-    +-- vSAN    <- vsan-memory (50)
+    :heap-{heap_name}    <- heap-memory (1)
+    :slab-{slab_name}    <- slab-memory (1)
+    :system    <- system-mem (3)
+    :vsan    <- vsan-memory (50)
   +-- Network
-    +-- CMMDS    <- cmmds-net (10)
-    +-- Host    <- vsan-host-net (16)
-    +-- Physical NIC:{vmnic}    <- vsan-pnic-net (42)
-    +-- RDT
-      +-- Host Latency    <- rdt-network-latency (17)
-      +-- Net    <- rdt-net (1)
-      +-- VMkernel Latency:{vmknic}    <- vnic-rdt-network-latency (17)
-    +-- TCP/IP Stack:{stack}    <- vsan-tcpip-stats (22)
-    +-- VMkernel NIC:{vmknic}    <- vsan-vnic-net (57)
-  +-- Placement
-    +-- CLOM    <- clom-host (2)
-    +-- CLOM Disk:{disk_uuid}    <- clom-disk (3)
-      [P] name
-    +-- CMMDS Workload    <- cmmds-workload (23)
-    +-- Distribution    <- vsan-distribution (5)
-  +-- Services
-    +-- File Service    <- vsan-file-service (8)
-    +-- IOInsight    <- ioinsight (82)
-    +-- PMEM    <- host-pmem (8)
-    +-- iSCSI
-      +-- Host    <- vsan-iscsi-host (10)
-      +-- LUN:{target}-{lun}    <- vsan-iscsi-lun (10)
-      +-- Target:{target}    <- vsan-iscsi-target (10)
-    +-- vSAN Direct    <- vsan-direct-host (8)
-    +-- vSAN Direct Cluster    <- vsan-direct-cluster (8)
+    +-- Host    <- cmmds-net (10), rdt-net (1), rdt-network-latency (17), vsan-host-net (16)
+    +-- Physical NIC
+      :{vmnic}    <- vsan-pnic-net (42)
+    +-- TCP/IP Stack
+      :{stack}    <- vsan-tcpip-stats (22)
+    +-- VMkernel NIC
+      :{vmknic}    <- vnic-rdt-network-latency (17), vsan-vnic-net (57)
+  +-- PMEM    <- host-pmem (8)
+  +-- Placement    <- clom-host (2), cmmds-workload (23), vsan-distribution (5)
   +-- Storage I/O
-    +-- DOM Client    <- host-domclient (78)
-    +-- DOM Component Manager    <- host-domcompmgr (82)
-    +-- DOM Owner    <- host-domowner (289)
-    +-- Remote DOM Client    <- host-remotedomclient (11)
-    +-- Remote DOM Client (Compute)    <- computeHost-remotedomclient (11)
-    +-- vsanSparse    <- host-vsansparse (21)
-  +-- zDOM
-    +-- Top Stats    <- host-zdom-top-stats (19)
-    +-- VTX    <- zdom-vtx (71)
+    :dom-client    <- host-domclient (78)
+    :dom-compmgr    <- host-domcompmgr (82)
+    :dom-owner    <- host-domowner (289)
+    :remote-dom-client    <- host-remotedomclient (11)
+    :remote-dom-client-compute    <- computeHost-remotedomclient (11)
+    :vsansparse    <- host-vsansparse (21)
+  +-- iSCSI
+    :host    <- vsan-iscsi-host (10)
+    :lun-{target}-{lun}    <- vsan-iscsi-lun (10)
+    :target-{target}    <- vsan-iscsi-target (10)
+  +-- vSAN Direct
+    :cluster    <- vsan-direct-cluster (8)
+    :host    <- vsan-direct-host (8)
+  +-- zDOM    <- host-zdom-top-stats (19), zdom-vtx (71)
   +-- Collector
     [P] lastUpdated
 ```
@@ -627,19 +565,40 @@ cptvsan
 
 ```
 cptvsan
-  +-- VM    <- virtual-machine (8)
-  +-- VM (Remote)    <- remote-virtual-machine (6)
-  +-- Virtual Disk:{vdisk_uuid}    <- virtual-disk (7)
+  +-- VM
+    :local    <- virtual-machine (8)
+    :remote    <- remote-virtual-machine (6)
+  +-- Virtual Disk
+    :remote-{disk_uuid}    <- remote-virtual-disk (3)
+    :{vdisk_uuid}    <- virtual-disk (7)
     [P] name
-  +-- Virtual Disk (Remote):{disk_uuid}    <- remote-virtual-disk (3)
-    [P] name
-  +-- vSCSI:{device}    <- vscsi (8)
-  +-- vSCSI (Remote):{device}    <- remote-vscsi (6)
+  +-- vSCSI
+    :remote-{device}    <- remote-vscsi (6)
+    :{device}    <- vscsi (8)
   +-- Collector
     [P] lastUpdated
 ```
 
-Properties: `name` is pushed only when the name map has a readable label different from the raw uuid/path (disk: `<model tokens> <serial> (<host name>)`; virtual disk: `<VM name> [<disk label>]`). Disk-hardware properties come from vCenter (`QueryDisksForVsan`, scsiTopology, HCL health summary), not from the Performance Service. `vsan-esa-disk-layer` and `vsan-esa-disk-scsifw` share the group `Disks|ESA Disk` and both carry these properties, so every such property is written twice per disk per cycle (counted as a key collision; their METRIC ids do not overlap).
+Properties: `name` is pushed only when the name map has a readable label different from the raw uuid/path (disk: `<model tokens> <serial> (<host name>)`; virtual disk: `<VM name> [<disk label>]`). Disk-hardware properties come from vCenter (`QueryDisksForVsan`, scsiTopology, HCL health summary), not from the Performance Service. `Disk:<disk_uuid>` is written by 6 entity types (`cache-disk`, `capacity-disk`, `clom-disk`, `ddh-disk`, `vsan-esa-disk-layer`, `vsan-esa-disk-scsifw`); `cache-disk`, `capacity-disk`, `vsan-esa-disk-layer`, `vsan-esa-disk-scsifw` carry these properties. An ESA disk is reported by both `vsan-esa-disk-layer` and `vsan-esa-disk-scsifw`, so on ESA every such property is written twice per disk per cycle (counted as a key collision). Metric-id overlaps inside one target are listed below.
+
+### Keys two entity types would both write
+
+Same target kind, group and instance template, same metric id -- so the same key. Computed from `TREE` and the model:
+
+| Target | Key shape | Entity types | Shared metric ids |
+|---|---|---|---|
+| HostSystem | `cptvsan\|Disk:{disk_uuid}\|<metric>` | `cache-disk`, `capacity-disk`, `vsan-esa-disk-scsifw` | 8: `iopsDevRead`, `iopsDevWrite`, `latencyDevDAvg`, `latencyDevGAvg`, `latencyDevRead`, `latencyDevWrite`, `throughputDevRead`, `throughputDevWrite` |
+
+The `Disk` overlap is between OSA cache / capacity disks and ESA disks. They are written under different disk uuids (an OSA disk is a cache disk or a capacity disk, and is not an ESA disk), so no single key receives two values; but nothing in the key says which architecture or role a disk has.
+
+### Reserved groups
+
+Top-level names held in `metric_tree.RESERVED` with **no data source yet**. Nothing is collected or pushed under them; they are reserved so that a future source lands on a stable key instead of forcing a rename (section 10, history continuity).
+
+| Reserved group | Why there is no source |
+|---|---|
+| `cptvsan\|Fibre Channel` | no vSAN Performance Service entity type in the captured schema |
+| `cptvsan\|Object Store` | no vSAN Performance Service entity type (S3 / Data Persistence) in the captured schema |
 
 ## 6. Units of measure
 
@@ -1083,56 +1042,56 @@ All pushed metrics with no unit, by entity type:
 
 | Entity type | Unitless / pushed | Metrics |
 |---|---|---|
-| `vsan-cluster-capacity` | 1/6 | `dedupRatio` |
 | `cluster-domclient` | 8/14 | `congestion`, `oio`, `readCongestion`, `writeCongestion`, `unmapCongestion`, `numOio`, `readCount`, `writeCount` |
-| `cluster-domowner` | 32/46 | `avgResyncParallelism`, `numCompleteResyncOps`, `numCompleteResyncRwrBatches`, `numCompleteRwrOps`, `numInflightPriorityResyncJobs`, `numInflightSharedResyncJobs`, `numPendingDecomResyncJobs`, `numPendingResyncJobs`, `numRunningResyncJobs`, `numSuspendedPriorityResyncJobs`, `numSuspendedResyncChangemaps`, `numSuspendedResyncJobs`, `numSuspendedSharedResyncJobs`, `numCompleteDeltaToBaseResyncOps`, `numCompleteFullResyncOps`, `numCompleteSiblingToDeltaResyncOps`, `numPendingDeltaToBaseResyncJobs`, `numPendingFullResyncJobs`, `numPendingSiblingToDeltaResyncJobs`, `numRunningDeltaToBaseResyncJobs`, `numRunningFullResyncJobs`, `numRunningSiblingToDeltaResyncJobs`, `numSuspendedDeltaToBaseResyncJobs`, `numSuspendedFullResyncJobs`, `numSuspendedSiblingToDeltaResyncJobs`, `totalDeltasCreatedCount`, `oio`, `numOio`, `congestion`, `readCongestion`, `writeCongestion`, `unmapCongestion` |
 | `cluster-domcompmgr` | 3/15 | `congestion`, `oio`, `numOio` |
-| `cluster-remotedomclient` | 2/8 | `congestion`, `oio` |
-| `computeCluster-remotedomclient` | 2/8 | `congestion`, `oio` |
-| `cluster-rdt-network-latency` | 2/17 | `numReadyDelay`, `kaReset` |
-| `cluster-zdom-top-stats` | 3/12 | `oioRead`, `oioWrite`, `oio` |
+| `cluster-domowner` | 32/46 | `avgResyncParallelism`, `numCompleteResyncOps`, `numCompleteResyncRwrBatches`, `numCompleteRwrOps`, `numInflightPriorityResyncJobs`, `numInflightSharedResyncJobs`, `numPendingDecomResyncJobs`, `numPendingResyncJobs`, `numRunningResyncJobs`, `numSuspendedPriorityResyncJobs`, `numSuspendedResyncChangemaps`, `numSuspendedResyncJobs`, `numSuspendedSharedResyncJobs`, `numCompleteDeltaToBaseResyncOps`, `numCompleteFullResyncOps`, `numCompleteSiblingToDeltaResyncOps`, `numPendingDeltaToBaseResyncJobs`, `numPendingFullResyncJobs`, `numPendingSiblingToDeltaResyncJobs`, `numRunningDeltaToBaseResyncJobs`, `numRunningFullResyncJobs`, `numRunningSiblingToDeltaResyncJobs`, `numSuspendedDeltaToBaseResyncJobs`, `numSuspendedFullResyncJobs`, `numSuspendedSiblingToDeltaResyncJobs`, `totalDeltasCreatedCount`, `oio`, `numOio`, `congestion`, `readCongestion`, `writeCongestion`, `unmapCongestion` |
 | `cluster-esa-dedup-domclient-io` | 12/24 | `dedupChunkReadCount`, `dedupChunkWriteCount`, `dedupEngineReadCount`, `dedupEngineWriteCount`, `dedupHashReadCount`, `dedupHashWriteCount`, `tputDedupChunkObjRead`, `tputDedupChunkObjWrite`, `tputDedupEngineRead`, `tputDedupEngineWrite`, `tputDedupHashObjRead`, `tputDedupHashObjWrite` |
-| `cluster-esa-dedup-domowner-io` | 12/24 | `dedupChunkReadCount`, `dedupChunkWriteCount`, `dedupEngineReadCount`, `dedupEngineWriteCount`, `dedupHashReadCount`, `dedupHashWriteCount`, `tputDedupChunkObjRead`, `tputDedupChunkObjWrite`, `tputDedupEngineRead`, `tputDedupEngineWrite`, `tputDedupHashObjRead`, `tputDedupHashObjWrite` |
 | `cluster-esa-dedup-domcompmgr-io` | 12/24 | `dedupChunkReadCount`, `dedupChunkWriteCount`, `dedupEngineReadCount`, `dedupEngineWriteCount`, `dedupHashReadCount`, `dedupHashWriteCount`, `tputDedupChunkObjRead`, `tputDedupChunkObjWrite`, `tputDedupEngineRead`, `tputDedupEngineWrite`, `tputDedupHashObjRead`, `tputDedupHashObjWrite` |
+| `cluster-esa-dedup-domowner-io` | 12/24 | `dedupChunkReadCount`, `dedupChunkWriteCount`, `dedupEngineReadCount`, `dedupEngineWriteCount`, `dedupHashReadCount`, `dedupHashWriteCount`, `tputDedupChunkObjRead`, `tputDedupChunkObjWrite`, `tputDedupEngineRead`, `tputDedupEngineWrite`, `tputDedupHashObjRead`, `tputDedupHashObjWrite` |
 | `cluster-esa-dedup-store-chunksvc` | 22/27 | `numChangeRefCount`, `numDeleteChunkExtent`, `numDeletedObjCleanup`, `numGetChunkEntries`, `numObjsReported`, `numReserveMba`, `rateBlocksInChunkDeleted`, `rateBlocksInChunkWritten`, `rateChangeRefCount`, `rateChunkRefEntAdded`, `rateChunkRefEntRemoved`, `rateChunksDeleted`, `rateChunksInChangeRefCount`, `rateChunksInDeleteChunkExtent`, `rateChunksInGetChunkEntries`, `rateChunksWritten`, `rateDeleteChunkExtent`, `rateDeletedObjCleanup`, `rateGetChunkEntries`, `rateReserveMba`, `totalNumBlks`, `totalNumRefCnt` |
 | `cluster-esa-dedup-store-hashsvc` | 29/34 | `currentGenNum`, `currentStaleGenNum`, `numDeleteChunksReq`, `numNewDupReq`, `numObjsReported`, `numReadLockWait`, `numUniqHashReq`, `numWriteLockWait`, `rateChunkInDeleteChunksReq`, `rateChunkInNewDupReq`, `rateChunkInUniqHashReq`, `rateDedupHashEntryAdded`, `rateDedupHashEntryRemoved`, `rateDedupHashEntryUpdated`, `rateDeleteChunksReq`, `rateDeletedChunks`, `rateHashKeyRemovalEntriesPerGen`, `rateHashKeyRemovalEntriesToScanInStep`, `rateHashKeyRemovalStepsDone`, `rateNewDupChunks`, `rateNewDupReq`, `rateOldDupChunks`, `rateReadLockWait`, `rateRetryChunks`, `rateSentriesAdded`, `rateSentriesRemoved`, `rateUniqChunks`, `rateUniqHashReq`, `rateWriteLockWait` |
+| `cluster-rdt-network-latency` | 2/17 | `numReadyDelay`, `kaReset` |
+| `cluster-remotedomclient` | 2/8 | `congestion`, `oio` |
+| `cluster-zdom-top-stats` | 3/12 | `oioRead`, `oioWrite`, `oio` |
+| `computeCluster-remotedomclient` | 2/8 | `congestion`, `oio` |
+| `vsan-cluster-capacity` | 1/6 | `dedupRatio` |
 | `vsan-dp-historical-stats` | 1/1 | `totalSnapshotCapacity` |
-| `vsan-pnic-net` | 27/41 | `rxPackets`, `txPackets`, `ioChainDrops`, `ioChainRxdrops`, `ioChainTxdrops`, `portRxpkts`, `portTxpkts`, `rxDrp`, `rxLgtErr`, `rxFrmErr`, `txDrp`, `txAbortErr`, `txFifoErr`, `txHeartErr`, `txWinErr`, `pfcCount`, `rxCrcErrRaw`, `txCarErrRaw`, `rxErrRaw`, `txErrRaw`, `pauseCountRaw`, `pfcCountRaw`, `rxMissErrRaw`, `rxOvErrRaw`, `rxFifoErrRaw`, `rxPktRaw`, `txPktRaw` |
-| `vsan-vnic-net` | 38/57 | `rxPackets`, `txPackets`, `tcpTxPackets`, `tcpRxPackets`, `tcpTxRexmitRate`, `tcpRxErrRate`, `ioChainDrops`, `tcpConnects`, `tcpSndacks`, `tcpRcvackpack`, `tcpRcvduppack`, `tcpRcvoopack`, `tcpRcvdupack`, `tcpSackRexmits`, `tcpSackSendBlocks`, `tcpSackRcvBlocks`, `tcpKeeptimeo`, `tcpPersisttimeo`, `tcpRexmttimeo`, `tcpTimeoutdrop`, `tcpConndrops`, `tcpDrops`, `tcpKeepdrops`, `tcpRcvmemdrop`, `tcpBadsyn`, `tcpBadrst`, `tcpRcvbadsum`, `tcpRcvbadoff`, `tcpRcvshort`, `ipTotal`, `ip6Total`, `ioChainRxdrops`, `ioChainTxdrops`, `portRxpkts`, `portTxpkts`, `tcpSndZeroWin`, `tcpEcnCe`, `arpDropRate` |
-| `vsan-tcpip-stats` | 9/22 | `tcpTxPackets`, `tcpRxPackets`, `tcpTxRexmitRate`, `tcpRxErrRate`, `ipTotal`, `ip6Total`, `tcpSndZeroWin`, `tcpEcnCe`, `arpDropRate` |
-| `rdt-network-latency` | 2/17 | `numReadyDelay`, `kaReset` |
-| `vnic-rdt-network-latency` | 2/17 | `numReadyDelay`, `kaReset` |
-| `rdt-net` | 1/1 | `checksumMismatchCount` |
-| `cmmds-net` | 5/10 | `rdtRx`, `rdtTx`, `groupRx`, `groupTxUcast`, `groupTxMcast` |
-| `vsan-host-net` | 10/16 | `rxPackets`, `txPackets`, `tcpTxPackets`, `tcpRxPackets`, `tcpTxRexmitRate`, `tcpRxErrRate`, `portRxpkts`, `portTxpkts`, `ioChainRxdrops`, `ioChainTxdrops` |
-| `host-domclient` | 43/78 | `ioCount`, `congestion`, `oio`, `readCount`, `writeCount`, `clientCacheHitRate`, `readCongestion`, `writeCongestion`, `numOio`, `unmapCount`, `unmapCongestion`, `segCleanerUnmapCongestion`, `rateClientOpsNoMem`, `rateClientOpsRetry`, `rateClientOpsNoSpace`, `rateClientOpsNoConnect`, `rateClientOpsIoError`, `rateClientOpsChecksumMismatch`, `rateClientOpsLimitExceed`, `rateClientOpsBadParam`, `rateClientOpsNotSupported`, `rateOtherClientOpsFailure`, `oioRead`, `oioWrite`, `oioResyncRead`, `oioRecoveryWrite`, `burstsPerSecond`, `avgBurstPeakOIO`, `avgBurstPeakOutstandingKb`, `avgPctTimeToPeak`, `bandwidthWithinBursts`, `numBurstStatsSkipped`, `burstsPerSecondMultiObj`, `avgBurstTotalTimeMultiObj`, `avgBurstArrivalTimeMultiObj`, `avgBurstCompletionTimeMultiObj`, `avgBurstPeakOIOMultiObj`, `avgBurstPeakOutstandingKbMultiObj`, `avgPctTimeToPeakMultiObj`, `bandwidthWithinBurstsMultiObj`, `bandwidthWithinBurstsExclFirstObj`, `lessSkewedMultiBurstsPerSecond`, `serverSwitchCount` |
-| `host-domowner` | 134/288 | `ioCount`, `congestion`, `oio`, `readCongestion`, `writeCongestion`, `recoveryWriteCongestion`, `readCount`, `resyncReadCount`, `writeCount`, `recWriteCount`, `numOio`, `unmapCount`, `recUnmapCount`, `unmapCongestion`, `recoveryUnmapCongestion`, `numCompleteResyncOps`, `numCompleteRwrOps`, `numCompleteResyncRwrBatches`, `avgResyncParallelism`, `numPendingResyncJobs`, `numPendingDecomResyncJobs`, `numSuspendedResyncJobs`, `numSuspendedResyncChangemaps`, `numSuspendedSharedResyncJobs`, `numSuspendedPriorityResyncJobs`, `numRunningResyncJobs`, `numInflightSharedResyncJobs`, `numInflightPriorityResyncJobs`, `highOIOCount`, `highOIONumTimes`, `highOIOAvgOIO`, `highOIOAvgIOCount`, `highOIOCountRead`, `highOIOCountPercentRead`, `highOIODurationPercentRead`, `highOIONumTimesRead`, `highOIOAvgOIORead`, `highOIOAvgIOCountRead`, `highOIOCountWrite`, `highOIOCountPercentWrite`, `highOIODurationPercentWrite`, `highOIONumTimesWrite`, `highOIOAvgOIOWrite`, `highOIOAvgIOCountWrite`, `numPendingFullResyncJobs`, `numPendingDeltaToBaseResyncJobs`, `numPendingSiblingToDeltaResyncJobs`, `numRunningFullResyncJobs`, `numRunningDeltaToBaseResyncJobs`, `numRunningSiblingToDeltaResyncJobs`, `numSuspendedFullResyncJobs`, `numSuspendedDeltaToBaseResyncJobs`, `numSuspendedSiblingToDeltaResyncJobs`, `deltaSourceChanges`, `resyncsStartedAsDeltaToBase`, `resyncsEndedAsDeltaToBase`, `deltaLeafGTEs`, `leafGTEs`, `totalDeltasCreatedCount`, `numCompleteDeltaToBaseResyncOps`, `numCompleteSiblingToDeltaResyncOps`, `numCompleteFullResyncOps`, `ownerECCacheNumCachedObjects`, `ownerECCacheNumFailedAllocs`, `ownerECCacheNumSuccessAllocs`, `ecWriteCount`, `ecStridedWriteCount`, `ecStridedWriteHits`, `ecCachedWriteCount`, `ecCachedWriteHits`, `ecFswCount`, `twoPCPrepareRetryCount`, `twoPCCommitCount`, `twoPCCommitSize`, `twoPCReservedLSNUsedCount`, `twoPCReservedLSNUnusedCount`, `twoPCReservedLSNExhaustedCount`, `segCleanerUnmapCongestion`, `numNetSchedRecoveryWriteTpThrottled`, `numNetSchedResyncReadTpThrottled`, `numNetSchedHighBand`, `numNetSchedMidBand`, `numNetSchedLowBand`, `numNetSchedHighBandLowLimit`, `numNetSchedLowBandHighLimit`, `numNetSchedMidBandHighLimit`, `numNetSchedHighBandHighShare`, `numNetSchedMidBandLowShare`, `numNetSchedLowToHighBand`, `numNetSchedLowToMidBand`, `numNetSchedMidToLowBand`, `numNetSchedMidToHighBand`, `numNetSchedHighToLowBand`, `numNetSchedHighToMidBand`, `numNetSchedControllerActivations`, `numBlockedResyncJobs`, `numBlockedSharedResyncJobs`, `numBlockedPriorityResyncJobs`, `numBlockedFullResyncJobs`, `numBlockedDeltaToBaseResyncJobs`, `numBlockedSiblingToDeltaResyncJobs`, `oioRead`, `oioWrite`, `oioResyncRead`, `oioRecoveryWrite`, `readLeafOwnerRetriesPerOp`, `writeLeafOwnerRetriesPerOp`, `readOwnerRetriesPerOp`, `writeOwnerRetriesPerOp`, `serverSwitchCount`, `rateOwnerOpsNoMem`, `rateOwnerOpsRetry`, `rateOwnerOpsNoSpace`, `rateOwnerOpsNoConnect`, `rateOwnerOpsIoError`, `rateOwnerOpsChecksumMismatch`, `rateOwnerOpsLimitExceed`, `rateOwnerOpsBadParam`, `rateOwnerOpsNotSupported`, `rateOtherOwnerOpsFailure`, `netSchedUnderUtilCount`, `netSchedUnderUtilGuestBps`, `netSchedUnderUtilTtlBps`, `netSchedBandwidthDiscoveryBps`, `netSchedBWDiscoverySessions`, `netSchedBWReallocationSessions`, `netSchedBWDiscoveryActions`, `netSchedBWReallocationActions`, `netSchedResyncGainsFromGuestCount`, `netSchedBWReallocationUtilizationRatioBelow`, `netSchedBWReallocationUtilizationRatioAbove`, `numSuspendedDedupResyncJobs`, `numInflightDedupResyncJobs`, `numPendingDedupResyncJobs` |
-| `host-domcompmgr` | 40/82 | `ioCount`, `congestion`, `oio`, `readCount`, `writeCount`, `recWriteCount`, `resyncReadCount`, `readCongestion`, `writeCongestion`, `recWriteCongestion`, `resyncReadCongestion`, `numOio`, `sharedCongestion`, `componentCongestion`, `metadataQueueDepthRead`, `metadataQueueDepthWrite`, `namespaceQueueDepthRead`, `namespaceQueueDepthWrite`, `resyncQueueDepthRead`, `resyncQueueDepthWrite`, `vmdiskQueueDepthRead`, `vmdiskQueueDepthWrite`, `unmapCount`, `recUnmapCount`, `unmapCongestion`, `recUnmapCongestion`, `rateCompmgrOpsNoMem`, `rateCompmgrOpsRetry`, `rateCompmgrOpsNoSpace`, `rateCompmgrOpsNoConnect`, `rateCompmgrOpsIoError`, `rateCompmgrOpsChecksumMismatch`, `rateCompmgrOpsLimitExceed`, `rateCompmgrOpsBadParam`, `rateCompmgrOpsNotSupported`, `rateOtherCompmgrOpsFailure`, `oioRead`, `oioWrite`, `oioResyncRead`, `oioRecoveryWrite` |
-| `host-remotedomclient` | 2/11 | `congestion`, `oio` |
-| `computeHost-remotedomclient` | 2/11 | `congestion`, `oio` |
-| `host-vsansparse` | 9/21 | `cacheInserts`, `cacheRemoves`, `cacheEntries`, `cacheAllocFails`, `cacheEvictAttempts`, `lruLockContentions`, `cacheLockContentions`, `cacheHitRate`, `readsToLayer` |
-| `vsan-esa-disk-layer` | 32/38 | `tputReadPerf`, `tputReadDiskPerf`, `avgLatReadPerf`, `maxReadTimePerf`, `minReadTimePerf`, `tputWritePerf`, `avgLatWritePerf`, `maxWriteTimePerf`, `minWriteTimePerf`, `tputReadCapacity`, `tputReadDiskCapacity`, `avgLatReadCapacity`, `maxReadTimeCapacity`, `minReadTimeCapacity`, `tputWriteCapacity`, `avgLatWriteCapacity`, `maxWriteTimeCapacity`, `minWriteTimeCapacity`, `tputUnmapPerf`, `avgLatUnmapPerf`, `maxUnmapTimePerf`, `minUnmapTimePerf`, `tputUnmapCapacity`, `avgLatUnmapCapacity`, `maxUnmapTimeCapacity`, `minUnmapTimeCapacity`, `readCountPerf`, `writeCountPerf`, `readCountCapacity`, `writeCountCapacity`, `unmapCountPerf`, `unmapCountCapacity` |
-| `vsan-esa-disk-scsifw` | 4/16 | `ioCountDevRead`, `ioCountDevWrite`, `outstandingCmdCount`, `ioCountDevUnmap` |
-| `disk-group` | 4/38 | `componentCongestionReadSched`, `componentCongestionWriteSched`, `diskgroupCongestionReadSched`, `diskgroupCongestionWriteSched` |
-| `ddh-disk` | 3/10 | `avgUnmapTPut`, `avgWriteTPut`, `logCongestion` |
-| `zdom-vtx` | 49/71 | `rateTxnReadWrite`, `rateTotalCacheMiss`, `rateTotalCacheRef`, `rateBankFlushTotalCacheRef`, `rateSegCleaningCtxDataTotalCacheRef`, `rateTxnPrefetchTotalCacheRef`, `rateTxnPrefetchLogicalTreeCacheRef`, `rateTxnPrefetchMiddleTreeCacheRef`, `rateTxnPrefetchSutCacheRef`, `rateTxnPrefetchTotalCacheMiss`, `rateTxnPrefetchLogicalTreeCacheMiss`, `rateTxnPrefetchMiddleTreeCacheMiss`, `rateTxnPrefetchSutCacheMiss`, `rateTxnBankTotalCacheRef`, `rateTxnBankLogicalTreeCacheRef`, `rateTxnBankMiddleTreeCacheRef`, `rateTxnBankSutCacheRef`, `rateTxnBankTotalCacheMiss`, `rateTxnBankLogicalTreeCacheMiss`, `rateTxnBankMiddleTreeCacheMiss`, `rateTxnBankSutCacheMiss`, `rateTxnUnmapTotalCacheMiss`, `rateTxnUnmapLogicalTreeCacheMiss`, `rateTxnUnmapMiddleTreeCacheMiss`, `rateTxnUnmapSutCacheMiss`, `rateTxnSegCleaningCtxDataTotalCacheRef`, `rateTxnSegCleaningCtxDataLogicalTreeCacheRef`, `rateTxnSegCleaningCtxDataMiddleTreeCacheRef`, `rateTxnSegCleaningCtxDataSutCacheRef`, `rateTxnSegCleaningCtxDataTotalCacheMiss`, `rateTxnSegCleaningCtxDataLogicalTreeCacheMiss`, `rateTxnSegCleaningCtxDataMiddleTreeCacheMiss`, `rateTxnSegCleaningCtxDataSutCacheMiss`, `rateTxnLookupCacheRef`, `rateTxnLookupLogicalTreeCacheRef`, `rateTxnLookupMiddleTreeCacheRef`, `rateTxnLookupCacheMiss`, `rateTxnLookupLogicalTreeCacheMiss`, `rateTxnLookupMiddleTreeCacheMiss`, `rateTotalLogicalTreeCacheMiss`, `rateTotalMiddleTreeCacheMiss`, `rateTotalSnapTreeCacheMiss`, `rateTotalBitmapCacheMiss`, `rateTotalSutCacheMiss`, `cacheMissPerPrefetchTxn`, `cacheMissPerSegCleaningCtxDataTxn`, `cacheMissPerLookupTxn`, `missesPerIO`, `rateTotDirtyCachePage` |
-| `host-zdom-top-stats` | 7/19 | `readCount`, `writeCount`, `unmapCount`, `ioCount`, `oioRead`, `oioWrite`, `oio` |
-| `vsan-memory` | 25/50 | `uwMemAllocMin`, `vsanmgmtdMemAllocMin`, `vsanmgmtdWatchdogMemAllocMin`, `clomdMemAllocMin`, `osfsdMemAllocMin`, `cmmdsdMemAllocMin`, `vitdMemAllocMin`, `vsandevicemonitordMemAllocMin`, `vsanobserverMemAllocMin`, `vsantracedMemAllocMin`, `epdMemAllocMin`, `cmmdsTimeMachineMemAllocMin`, `uwMemAllocMax`, `vsanmgmtdMemAllocMax`, `vsanmgmtdWatchdogMemAllocMax`, `clomdMemAllocMax`, `osfsdMemAllocMax`, `cmmdsdMemAllocMax`, `vitdMemAllocMax`, `vsandevicemonitordMemAllocMax`, `vsanobserverMemAllocMax`, `vsantracedMemAllocMax`, `epdMemAllocMax`, `cmmdsTimeMachineMemAllocMax`, `kernelConsumedSize` |
-| `clom-host` | 2/2 | `nodeCompCntRatio`, `nodeDataCompCntRatio` |
 | `clom-disk` | 3/3 | `diskCompCntRatio`, `diskDataCompCntRatio`, `diskgrpDataCompCntRatio` |
+| `clom-host` | 2/2 | `nodeCompCntRatio`, `nodeDataCompCntRatio` |
+| `cmmds-net` | 5/10 | `rdtRx`, `rdtTx`, `groupRx`, `groupTxUcast`, `groupTxMcast` |
 | `cmmds-workload` | 22/23 | `agentBatchesSent`, `checkPointBatchesSent`, `masterBatchesRecved`, `rxAccept`, `rxAgentUpdateRequest`, `rxHeartbeatRequest`, `rxMasterUpdate`, `rxMisc`, `rxRetransmitRequest`, `rxSnapshot`, `totalUpdInBatchCkpt`, `totalUpdInMasterBatches`, `totalUpdSentInAgentBatch`, `txAgentUpdateRequest`, `txHeartbeatRequest`, `txMasterCheckpoint`, `txMasterCkptTried`, `txMasterUpdate`, `txMasterUpdateTried`, `txRetransmitRequest`, `txSnapshot`, `txSnapshotTried` |
-| `vsan-distribution` | 5/5 | `components`, `domClients`, `domColocated`, `domOwners`, `ioComponents` |
+| `computeHost-remotedomclient` | 2/11 | `congestion`, `oio` |
+| `ddh-disk` | 3/10 | `avgUnmapTPut`, `avgWriteTPut`, `logCongestion` |
+| `disk-group` | 4/38 | `componentCongestionReadSched`, `componentCongestionWriteSched`, `diskgroupCongestionReadSched`, `diskgroupCongestionWriteSched` |
+| `host-domclient` | 43/78 | `ioCount`, `congestion`, `oio`, `readCount`, `writeCount`, `clientCacheHitRate`, `readCongestion`, `writeCongestion`, `numOio`, `unmapCount`, `unmapCongestion`, `segCleanerUnmapCongestion`, `rateClientOpsNoMem`, `rateClientOpsRetry`, `rateClientOpsNoSpace`, `rateClientOpsNoConnect`, `rateClientOpsIoError`, `rateClientOpsChecksumMismatch`, `rateClientOpsLimitExceed`, `rateClientOpsBadParam`, `rateClientOpsNotSupported`, `rateOtherClientOpsFailure`, `oioRead`, `oioWrite`, `oioResyncRead`, `oioRecoveryWrite`, `burstsPerSecond`, `avgBurstPeakOIO`, `avgBurstPeakOutstandingKb`, `avgPctTimeToPeak`, `bandwidthWithinBursts`, `numBurstStatsSkipped`, `burstsPerSecondMultiObj`, `avgBurstTotalTimeMultiObj`, `avgBurstArrivalTimeMultiObj`, `avgBurstCompletionTimeMultiObj`, `avgBurstPeakOIOMultiObj`, `avgBurstPeakOutstandingKbMultiObj`, `avgPctTimeToPeakMultiObj`, `bandwidthWithinBurstsMultiObj`, `bandwidthWithinBurstsExclFirstObj`, `lessSkewedMultiBurstsPerSecond`, `serverSwitchCount` |
+| `host-domcompmgr` | 40/82 | `ioCount`, `congestion`, `oio`, `readCount`, `writeCount`, `recWriteCount`, `resyncReadCount`, `readCongestion`, `writeCongestion`, `recWriteCongestion`, `resyncReadCongestion`, `numOio`, `sharedCongestion`, `componentCongestion`, `metadataQueueDepthRead`, `metadataQueueDepthWrite`, `namespaceQueueDepthRead`, `namespaceQueueDepthWrite`, `resyncQueueDepthRead`, `resyncQueueDepthWrite`, `vmdiskQueueDepthRead`, `vmdiskQueueDepthWrite`, `unmapCount`, `recUnmapCount`, `unmapCongestion`, `recUnmapCongestion`, `rateCompmgrOpsNoMem`, `rateCompmgrOpsRetry`, `rateCompmgrOpsNoSpace`, `rateCompmgrOpsNoConnect`, `rateCompmgrOpsIoError`, `rateCompmgrOpsChecksumMismatch`, `rateCompmgrOpsLimitExceed`, `rateCompmgrOpsBadParam`, `rateCompmgrOpsNotSupported`, `rateOtherCompmgrOpsFailure`, `oioRead`, `oioWrite`, `oioResyncRead`, `oioRecoveryWrite` |
+| `host-domowner` | 134/288 | `ioCount`, `congestion`, `oio`, `readCongestion`, `writeCongestion`, `recoveryWriteCongestion`, `readCount`, `resyncReadCount`, `writeCount`, `recWriteCount`, `numOio`, `unmapCount`, `recUnmapCount`, `unmapCongestion`, `recoveryUnmapCongestion`, `numCompleteResyncOps`, `numCompleteRwrOps`, `numCompleteResyncRwrBatches`, `avgResyncParallelism`, `numPendingResyncJobs`, `numPendingDecomResyncJobs`, `numSuspendedResyncJobs`, `numSuspendedResyncChangemaps`, `numSuspendedSharedResyncJobs`, `numSuspendedPriorityResyncJobs`, `numRunningResyncJobs`, `numInflightSharedResyncJobs`, `numInflightPriorityResyncJobs`, `highOIOCount`, `highOIONumTimes`, `highOIOAvgOIO`, `highOIOAvgIOCount`, `highOIOCountRead`, `highOIOCountPercentRead`, `highOIODurationPercentRead`, `highOIONumTimesRead`, `highOIOAvgOIORead`, `highOIOAvgIOCountRead`, `highOIOCountWrite`, `highOIOCountPercentWrite`, `highOIODurationPercentWrite`, `highOIONumTimesWrite`, `highOIOAvgOIOWrite`, `highOIOAvgIOCountWrite`, `numPendingFullResyncJobs`, `numPendingDeltaToBaseResyncJobs`, `numPendingSiblingToDeltaResyncJobs`, `numRunningFullResyncJobs`, `numRunningDeltaToBaseResyncJobs`, `numRunningSiblingToDeltaResyncJobs`, `numSuspendedFullResyncJobs`, `numSuspendedDeltaToBaseResyncJobs`, `numSuspendedSiblingToDeltaResyncJobs`, `deltaSourceChanges`, `resyncsStartedAsDeltaToBase`, `resyncsEndedAsDeltaToBase`, `deltaLeafGTEs`, `leafGTEs`, `totalDeltasCreatedCount`, `numCompleteDeltaToBaseResyncOps`, `numCompleteSiblingToDeltaResyncOps`, `numCompleteFullResyncOps`, `ownerECCacheNumCachedObjects`, `ownerECCacheNumFailedAllocs`, `ownerECCacheNumSuccessAllocs`, `ecWriteCount`, `ecStridedWriteCount`, `ecStridedWriteHits`, `ecCachedWriteCount`, `ecCachedWriteHits`, `ecFswCount`, `twoPCPrepareRetryCount`, `twoPCCommitCount`, `twoPCCommitSize`, `twoPCReservedLSNUsedCount`, `twoPCReservedLSNUnusedCount`, `twoPCReservedLSNExhaustedCount`, `segCleanerUnmapCongestion`, `numNetSchedRecoveryWriteTpThrottled`, `numNetSchedResyncReadTpThrottled`, `numNetSchedHighBand`, `numNetSchedMidBand`, `numNetSchedLowBand`, `numNetSchedHighBandLowLimit`, `numNetSchedLowBandHighLimit`, `numNetSchedMidBandHighLimit`, `numNetSchedHighBandHighShare`, `numNetSchedMidBandLowShare`, `numNetSchedLowToHighBand`, `numNetSchedLowToMidBand`, `numNetSchedMidToLowBand`, `numNetSchedMidToHighBand`, `numNetSchedHighToLowBand`, `numNetSchedHighToMidBand`, `numNetSchedControllerActivations`, `numBlockedResyncJobs`, `numBlockedSharedResyncJobs`, `numBlockedPriorityResyncJobs`, `numBlockedFullResyncJobs`, `numBlockedDeltaToBaseResyncJobs`, `numBlockedSiblingToDeltaResyncJobs`, `oioRead`, `oioWrite`, `oioResyncRead`, `oioRecoveryWrite`, `readLeafOwnerRetriesPerOp`, `writeLeafOwnerRetriesPerOp`, `readOwnerRetriesPerOp`, `writeOwnerRetriesPerOp`, `serverSwitchCount`, `rateOwnerOpsNoMem`, `rateOwnerOpsRetry`, `rateOwnerOpsNoSpace`, `rateOwnerOpsNoConnect`, `rateOwnerOpsIoError`, `rateOwnerOpsChecksumMismatch`, `rateOwnerOpsLimitExceed`, `rateOwnerOpsBadParam`, `rateOwnerOpsNotSupported`, `rateOtherOwnerOpsFailure`, `netSchedUnderUtilCount`, `netSchedUnderUtilGuestBps`, `netSchedUnderUtilTtlBps`, `netSchedBandwidthDiscoveryBps`, `netSchedBWDiscoverySessions`, `netSchedBWReallocationSessions`, `netSchedBWDiscoveryActions`, `netSchedBWReallocationActions`, `netSchedResyncGainsFromGuestCount`, `netSchedBWReallocationUtilizationRatioBelow`, `netSchedBWReallocationUtilizationRatioAbove`, `numSuspendedDedupResyncJobs`, `numInflightDedupResyncJobs`, `numPendingDedupResyncJobs` |
 | `host-esa-dedup-domclient-io` | 12/24 | `dedupChunkReadCount`, `dedupChunkWriteCount`, `dedupEngineReadCount`, `dedupEngineWriteCount`, `dedupHashReadCount`, `dedupHashWriteCount`, `tputDedupChunkObjRead`, `tputDedupChunkObjWrite`, `tputDedupEngineRead`, `tputDedupEngineWrite`, `tputDedupHashObjRead`, `tputDedupHashObjWrite` |
-| `host-esa-dedup-domowner-io` | 12/24 | `dedupChunkReadCount`, `dedupChunkWriteCount`, `dedupEngineReadCount`, `dedupEngineWriteCount`, `dedupHashReadCount`, `dedupHashWriteCount`, `tputDedupChunkObjRead`, `tputDedupChunkObjWrite`, `tputDedupEngineRead`, `tputDedupEngineWrite`, `tputDedupHashObjRead`, `tputDedupHashObjWrite` |
 | `host-esa-dedup-domcompmgr-io` | 12/24 | `dedupChunkReadCount`, `dedupChunkWriteCount`, `dedupEngineReadCount`, `dedupEngineWriteCount`, `dedupHashReadCount`, `dedupHashWriteCount`, `tputDedupChunkObjRead`, `tputDedupChunkObjWrite`, `tputDedupEngineRead`, `tputDedupEngineWrite`, `tputDedupHashObjRead`, `tputDedupHashObjWrite` |
+| `host-esa-dedup-domowner-io` | 12/24 | `dedupChunkReadCount`, `dedupChunkWriteCount`, `dedupEngineReadCount`, `dedupEngineWriteCount`, `dedupHashReadCount`, `dedupHashWriteCount`, `tputDedupChunkObjRead`, `tputDedupChunkObjWrite`, `tputDedupEngineRead`, `tputDedupEngineWrite`, `tputDedupHashObjRead`, `tputDedupHashObjWrite` |
 | `host-esa-dedup-store-chunksvc` | 22/27 | `numChangeRefCount`, `numDeleteChunkExtent`, `numDeletedObjCleanup`, `numGetChunkEntries`, `numObjsReported`, `numReserveMba`, `rateBlocksInChunkDeleted`, `rateBlocksInChunkWritten`, `rateChangeRefCount`, `rateChunkRefEntAdded`, `rateChunkRefEntRemoved`, `rateChunksDeleted`, `rateChunksInChangeRefCount`, `rateChunksInDeleteChunkExtent`, `rateChunksInGetChunkEntries`, `rateChunksWritten`, `rateDeleteChunkExtent`, `rateDeletedObjCleanup`, `rateGetChunkEntries`, `rateReserveMba`, `totalNumBlks`, `totalNumRefCnt` |
 | `host-esa-dedup-store-hashsvc` | 29/34 | `currentGenNum`, `currentStaleGenNum`, `numDeleteChunksReq`, `numNewDupReq`, `numObjsReported`, `numReadLockWait`, `numUniqHashReq`, `numWriteLockWait`, `rateChunkInDeleteChunksReq`, `rateChunkInNewDupReq`, `rateChunkInUniqHashReq`, `rateDedupHashEntryAdded`, `rateDedupHashEntryRemoved`, `rateDedupHashEntryUpdated`, `rateDeleteChunksReq`, `rateDeletedChunks`, `rateHashKeyRemovalEntriesPerGen`, `rateHashKeyRemovalEntriesToScanInStep`, `rateHashKeyRemovalStepsDone`, `rateNewDupChunks`, `rateNewDupReq`, `rateOldDupChunks`, `rateReadLockWait`, `rateRetryChunks`, `rateSentriesAdded`, `rateSentriesRemoved`, `rateUniqChunks`, `rateUniqHashReq`, `rateWriteLockWait` |
-| `vsan-iscsi-host` | 1/10 | `queueDepth` |
-| `vsan-iscsi-target` | 1/10 | `queueDepth` |
-| `vsan-iscsi-lun` | 1/10 | `queueDepth` |
-| `vsan-direct-host` | 2/8 | `oioDevRead`, `oioDevWrite` |
-| `vsan-direct-cluster` | 2/8 | `oioDevRead`, `oioDevWrite` |
+| `host-remotedomclient` | 2/11 | `congestion`, `oio` |
+| `host-vsansparse` | 9/21 | `cacheInserts`, `cacheRemoves`, `cacheEntries`, `cacheAllocFails`, `cacheEvictAttempts`, `lruLockContentions`, `cacheLockContentions`, `cacheHitRate`, `readsToLayer` |
+| `host-zdom-top-stats` | 7/19 | `readCount`, `writeCount`, `unmapCount`, `ioCount`, `oioRead`, `oioWrite`, `oio` |
 | `ioinsight` | 74/82 | `aligned4kRatio`, `aligned4kReadRatio`, `aligned4kWriteRatio`, `randomRatio`, `randomReadRatio`, `randomWriteRatio`, `readRatio`, `riosz0_4k`, `riosz128k`, `riosz128k_256k`, `riosz16k`, `riosz16k_32k`, `riosz1_m`, `riosz1m`, `riosz256k`, `riosz256k_512k`, `riosz32k`, `riosz32k_64k`, `riosz4k`, `riosz4k_8k`, `riosz512k`, `riosz512k_1m`, `riosz64k`, `riosz64k_128k`, `riosz8k`, `riosz8k_16k`, `rlat0_1us`, `rlat100_500us`, `rlat100_ms`, `rlat10_100us`, `rlat10_25ms`, `rlat1_10us`, `rlat1_5ms`, `rlat25_50ms`, `rlat500us_1ms`, `rlat50_100ms`, `rlat5_10ms`, `sequentialRatio`, `sequentialReadRatio`, `sequentialWriteRatio`, `unaligned4kRatio`, `unaligned4kReadRatio`, `unaligned4kWriteRatio`, `wiosz0_4k`, `wiosz128k`, `wiosz128k_256k`, `wiosz16k`, `wiosz16k_32k`, `wiosz1_m`, `wiosz1m`, `wiosz256k`, `wiosz256k_512k`, `wiosz32k`, `wiosz32k_64k`, `wiosz4k`, `wiosz4k_8k`, `wiosz512k`, `wiosz512k_1m`, `wiosz64k`, `wiosz64k_128k`, `wiosz8k`, `wiosz8k_16k`, `wlat0_1us`, `wlat100_500us`, `wlat100_ms`, `wlat10_100us`, `wlat10_25ms`, `wlat1_10us`, `wlat1_5ms`, `wlat25_50ms`, `wlat500us_1ms`, `wlat50_100ms`, `wlat5_10ms`, `writeRatio` |
+| `rdt-net` | 1/1 | `checksumMismatchCount` |
+| `rdt-network-latency` | 2/17 | `numReadyDelay`, `kaReset` |
+| `vnic-rdt-network-latency` | 2/17 | `numReadyDelay`, `kaReset` |
+| `vsan-direct-cluster` | 2/8 | `oioDevRead`, `oioDevWrite` |
+| `vsan-direct-host` | 2/8 | `oioDevRead`, `oioDevWrite` |
+| `vsan-distribution` | 5/5 | `components`, `domClients`, `domColocated`, `domOwners`, `ioComponents` |
+| `vsan-esa-disk-layer` | 32/38 | `tputReadPerf`, `tputReadDiskPerf`, `avgLatReadPerf`, `maxReadTimePerf`, `minReadTimePerf`, `tputWritePerf`, `avgLatWritePerf`, `maxWriteTimePerf`, `minWriteTimePerf`, `tputReadCapacity`, `tputReadDiskCapacity`, `avgLatReadCapacity`, `maxReadTimeCapacity`, `minReadTimeCapacity`, `tputWriteCapacity`, `avgLatWriteCapacity`, `maxWriteTimeCapacity`, `minWriteTimeCapacity`, `tputUnmapPerf`, `avgLatUnmapPerf`, `maxUnmapTimePerf`, `minUnmapTimePerf`, `tputUnmapCapacity`, `avgLatUnmapCapacity`, `maxUnmapTimeCapacity`, `minUnmapTimeCapacity`, `readCountPerf`, `writeCountPerf`, `readCountCapacity`, `writeCountCapacity`, `unmapCountPerf`, `unmapCountCapacity` |
+| `vsan-esa-disk-scsifw` | 4/16 | `ioCountDevRead`, `ioCountDevWrite`, `outstandingCmdCount`, `ioCountDevUnmap` |
+| `vsan-host-net` | 10/16 | `rxPackets`, `txPackets`, `tcpTxPackets`, `tcpRxPackets`, `tcpTxRexmitRate`, `tcpRxErrRate`, `portRxpkts`, `portTxpkts`, `ioChainRxdrops`, `ioChainTxdrops` |
+| `vsan-iscsi-host` | 1/10 | `queueDepth` |
+| `vsan-iscsi-lun` | 1/10 | `queueDepth` |
+| `vsan-iscsi-target` | 1/10 | `queueDepth` |
+| `vsan-memory` | 25/50 | `uwMemAllocMin`, `vsanmgmtdMemAllocMin`, `vsanmgmtdWatchdogMemAllocMin`, `clomdMemAllocMin`, `osfsdMemAllocMin`, `cmmdsdMemAllocMin`, `vitdMemAllocMin`, `vsandevicemonitordMemAllocMin`, `vsanobserverMemAllocMin`, `vsantracedMemAllocMin`, `epdMemAllocMin`, `cmmdsTimeMachineMemAllocMin`, `uwMemAllocMax`, `vsanmgmtdMemAllocMax`, `vsanmgmtdWatchdogMemAllocMax`, `clomdMemAllocMax`, `osfsdMemAllocMax`, `cmmdsdMemAllocMax`, `vitdMemAllocMax`, `vsandevicemonitordMemAllocMax`, `vsanobserverMemAllocMax`, `vsantracedMemAllocMax`, `epdMemAllocMax`, `cmmdsTimeMachineMemAllocMax`, `kernelConsumedSize` |
+| `vsan-pnic-net` | 27/41 | `rxPackets`, `txPackets`, `ioChainDrops`, `ioChainRxdrops`, `ioChainTxdrops`, `portRxpkts`, `portTxpkts`, `rxDrp`, `rxLgtErr`, `rxFrmErr`, `txDrp`, `txAbortErr`, `txFifoErr`, `txHeartErr`, `txWinErr`, `pfcCount`, `rxCrcErrRaw`, `txCarErrRaw`, `rxErrRaw`, `txErrRaw`, `pauseCountRaw`, `pfcCountRaw`, `rxMissErrRaw`, `rxOvErrRaw`, `rxFifoErrRaw`, `rxPktRaw`, `txPktRaw` |
+| `vsan-tcpip-stats` | 9/22 | `tcpTxPackets`, `tcpRxPackets`, `tcpTxRexmitRate`, `tcpRxErrRate`, `ipTotal`, `ip6Total`, `tcpSndZeroWin`, `tcpEcnCe`, `arpDropRate` |
+| `vsan-vnic-net` | 38/57 | `rxPackets`, `txPackets`, `tcpTxPackets`, `tcpRxPackets`, `tcpTxRexmitRate`, `tcpRxErrRate`, `ioChainDrops`, `tcpConnects`, `tcpSndacks`, `tcpRcvackpack`, `tcpRcvduppack`, `tcpRcvoopack`, `tcpRcvdupack`, `tcpSackRexmits`, `tcpSackSendBlocks`, `tcpSackRcvBlocks`, `tcpKeeptimeo`, `tcpPersisttimeo`, `tcpRexmttimeo`, `tcpTimeoutdrop`, `tcpConndrops`, `tcpDrops`, `tcpKeepdrops`, `tcpRcvmemdrop`, `tcpBadsyn`, `tcpBadrst`, `tcpRcvbadsum`, `tcpRcvbadoff`, `tcpRcvshort`, `ipTotal`, `ip6Total`, `ioChainRxdrops`, `ioChainTxdrops`, `portRxpkts`, `portTxpkts`, `tcpSndZeroWin`, `tcpEcnCe`, `arpDropRate` |
+| `zdom-vtx` | 49/71 | `rateTxnReadWrite`, `rateTotalCacheMiss`, `rateTotalCacheRef`, `rateBankFlushTotalCacheRef`, `rateSegCleaningCtxDataTotalCacheRef`, `rateTxnPrefetchTotalCacheRef`, `rateTxnPrefetchLogicalTreeCacheRef`, `rateTxnPrefetchMiddleTreeCacheRef`, `rateTxnPrefetchSutCacheRef`, `rateTxnPrefetchTotalCacheMiss`, `rateTxnPrefetchLogicalTreeCacheMiss`, `rateTxnPrefetchMiddleTreeCacheMiss`, `rateTxnPrefetchSutCacheMiss`, `rateTxnBankTotalCacheRef`, `rateTxnBankLogicalTreeCacheRef`, `rateTxnBankMiddleTreeCacheRef`, `rateTxnBankSutCacheRef`, `rateTxnBankTotalCacheMiss`, `rateTxnBankLogicalTreeCacheMiss`, `rateTxnBankMiddleTreeCacheMiss`, `rateTxnBankSutCacheMiss`, `rateTxnUnmapTotalCacheMiss`, `rateTxnUnmapLogicalTreeCacheMiss`, `rateTxnUnmapMiddleTreeCacheMiss`, `rateTxnUnmapSutCacheMiss`, `rateTxnSegCleaningCtxDataTotalCacheRef`, `rateTxnSegCleaningCtxDataLogicalTreeCacheRef`, `rateTxnSegCleaningCtxDataMiddleTreeCacheRef`, `rateTxnSegCleaningCtxDataSutCacheRef`, `rateTxnSegCleaningCtxDataTotalCacheMiss`, `rateTxnSegCleaningCtxDataLogicalTreeCacheMiss`, `rateTxnSegCleaningCtxDataMiddleTreeCacheMiss`, `rateTxnSegCleaningCtxDataSutCacheMiss`, `rateTxnLookupCacheRef`, `rateTxnLookupLogicalTreeCacheRef`, `rateTxnLookupMiddleTreeCacheRef`, `rateTxnLookupCacheMiss`, `rateTxnLookupLogicalTreeCacheMiss`, `rateTxnLookupMiddleTreeCacheMiss`, `rateTotalLogicalTreeCacheMiss`, `rateTotalMiddleTreeCacheMiss`, `rateTotalSnapTreeCacheMiss`, `rateTotalBitmapCacheMiss`, `rateTotalSutCacheMiss`, `cacheMissPerPrefetchTxn`, `cacheMissPerSegCleaningCtxDataTxn`, `cacheMissPerLookupTxn`, `missesPerIO`, `rateTotDirtyCachePage` |
 | `virtual-machine` | 2/8 | `readCount`, `writeCount` |
 | `vscsi` | 2/8 | `readCount`, `writeCount` |
 
@@ -1173,197 +1132,220 @@ Model kind `VsanClusterCapacity`, model label "Vsan Cluster Capacity"; identity 
 | `cptvsan\|Capacity\|dedupRatio` | Space Efficiency Ratio (100 = 1.00x) | override | unit unknown | none (HCIBench `short` is dimensionless) | percentage | V |  |
 | `cptvsan\|Capacity\|totalDpOverhead` | DP overhead (total) | derived | `DATA_SIZE.BYTE` | hand override (UNIT_OVERRIDE) | - |  |  |
 
-#### `cptvsan|ESA Dedup|Chunk Service` <- `cluster-esa-dedup-store-chunksvc`
+#### `cptvsan|Data Protection` <- `vsan-dp-historical-stats`
 
-Model kind `VsanClusterEsaDedupStoreChunksvc`, model label "vSAN Cluster ESA Dedup Store Chunksvc"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+Model kind `VsanDpHistoricalStats`, model label "Vsan Dp Historical Stats"; identity `cluster_uuid`; objects observed **1**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyChangeRefCount` | Change Ref Count Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyDeleteChunkExtent` | Delete Chunk Extent Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyDeletedObjCleanup` | Deleted Object Clean Up Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyGetChunkEntries` | Get Chunk Entries Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyReserveMba` | Reserve MBA Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numChangeRefCount` | Change Ref Count Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numDeleteChunkExtent` | Delete Chunk Extent Request Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numDeletedObjCleanup` | Deleted Object Clean Up Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numGetChunkEntries` | Get Chunk Entries Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numObjsReported` | Reported Chunk Objects | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numReserveMba` | Reserve MBA Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateBlocksInChunkDeleted` | Blocks in Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateBlocksInChunkWritten` | Blocks in Written Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChangeRefCount` | Change Ref Count Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunkRefEntAdded` | Added Chunk Ref Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunkRefEntRemoved` | Removed Chunk Ref Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksDeleted` | Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksInChangeRefCount` | Chunks in Change Ref Count Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksInDeleteChunkExtent` | Chunks in Delete Chunk Extent Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksInGetChunkEntries` | Chunks in Get Chunk Entries Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksWritten` | Write Chunk Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateDeleteChunkExtent` | Delete Chunk Extent Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateDeletedObjCleanup` | Deleted Object Clean Up Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateGetChunkEntries` | Get Chunk Entries Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateReserveMba` | Reserve MBA Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|totalNumBlks` | Total Number of Blocks of All Chunks | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|totalNumRefCnt` | Total Ref Count of All Chunks | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|Data Protection\|totalSnapshotCapacity` | Used By Snapshots | schema | unit unknown | none (no HCIBench entry, no name rule) | size_bytes |  |  |
 
-#### `cptvsan|ESA Dedup|DOM Client I/O` <- `cluster-esa-dedup-domclient-io`
+#### `cptvsan|ESA Dedup:dom-client-io` <- `cluster-esa-dedup-domclient-io`
 
 Model kind `VsanClusterEsaDedupDomclientIo`, model label "vSAN Cluster ESA Dedup Domclient IO"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
 
-#### `cptvsan|ESA Dedup|DOM Component Manager I/O` <- `cluster-esa-dedup-domcompmgr-io`
+#### `cptvsan|ESA Dedup:dom-compmgr-io` <- `cluster-esa-dedup-domcompmgr-io`
 
 Model kind `VsanClusterEsaDedupDomcompmgrIo`, model label "vSAN Cluster ESA Dedup Domcompmgr IO"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
 
-#### `cptvsan|ESA Dedup|DOM Owner I/O` <- `cluster-esa-dedup-domowner-io`
+#### `cptvsan|ESA Dedup:dom-owner-io` <- `cluster-esa-dedup-domowner-io`
 
 Model kind `VsanClusterEsaDedupDomownerIo`, model label "vSAN Cluster ESA Dedup Domowner IO"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
 
-#### `cptvsan|ESA Dedup|Hash Service` <- `cluster-esa-dedup-store-hashsvc`
+#### `cptvsan|ESA Dedup:chunk-service` <- `cluster-esa-dedup-store-chunksvc`
+
+Model kind `VsanClusterEsaDedupStoreChunksvc`, model label "vSAN Cluster ESA Dedup Store Chunksvc"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|ESA Dedup:chunk-service\|latencyChangeRefCount` | Change Ref Count Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|latencyDeleteChunkExtent` | Delete Chunk Extent Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|latencyDeletedObjCleanup` | Deleted Object Clean Up Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|latencyGetChunkEntries` | Get Chunk Entries Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|latencyReserveMba` | Reserve MBA Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numChangeRefCount` | Change Ref Count Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numDeleteChunkExtent` | Delete Chunk Extent Request Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numDeletedObjCleanup` | Deleted Object Clean Up Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numGetChunkEntries` | Get Chunk Entries Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numObjsReported` | Reported Chunk Objects | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numReserveMba` | Reserve MBA Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateBlocksInChunkDeleted` | Blocks in Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateBlocksInChunkWritten` | Blocks in Written Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChangeRefCount` | Change Ref Count Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunkRefEntAdded` | Added Chunk Ref Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunkRefEntRemoved` | Removed Chunk Ref Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksDeleted` | Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksInChangeRefCount` | Chunks in Change Ref Count Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksInDeleteChunkExtent` | Chunks in Delete Chunk Extent Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksInGetChunkEntries` | Chunks in Get Chunk Entries Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksWritten` | Write Chunk Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateDeleteChunkExtent` | Delete Chunk Extent Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateDeletedObjCleanup` | Deleted Object Clean Up Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateGetChunkEntries` | Get Chunk Entries Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateReserveMba` | Reserve MBA Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|totalNumBlks` | Total Number of Blocks of All Chunks | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|totalNumRefCnt` | Total Ref Count of All Chunks | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+
+#### `cptvsan|ESA Dedup:hash-service` <- `cluster-esa-dedup-store-hashsvc`
 
 Model kind `VsanClusterEsaDedupStoreHashsvc`, model label "vSAN Cluster ESA Dedup Store Hashsvc"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|Hash Service\|currentGenNum` | Gen Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|currentStaleGenNum` | Current Stale Gen Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyDeleteChunksReq` | Delete Chunk Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyNewDupReq` | New Dup Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyReadLockWait` | Read Lock Wait Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyUniqueHashReq` | Unique Hash Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyWriteLockWait` | Write Lock Wait Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numDeleteChunksReq` | Delete Chunk Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numNewDupReq` | New Dup Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numObjsReported` | Reported Chunk Objects | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numReadLockWait` | Read Lock Wait Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numUniqHashReq` | Unique Hash Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numWriteLockWait` | Write Lock Wait Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateChunkInDeleteChunksReq` | Chunks in Delete Chunks Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateChunkInNewDupReq` | Chunks in New Dup Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateChunkInUniqHashReq` | Chunks in Unique Hash Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDedupHashEntryAdded` | Added Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDedupHashEntryRemoved` | Removed Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDedupHashEntryUpdated` | Updated Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDeleteChunksReq` | Delete Chunk Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDeletedChunks` | Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateHashKeyRemovalEntriesPerGen` | Hash Key Removal Entries per Gen Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateHashKeyRemovalEntriesToScanInStep` | Hash Key Removal Entries to Scan in Latest Step Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateHashKeyRemovalStepsDone` | Steps Done in Current Scan Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateNewDupChunks` | Processed New Dup Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateNewDupReq` | New Dup Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateOldDupChunks` | Processed Old Dup Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateReadLockWait` | Read Lock Wait Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateRetryChunks` | Processed Transient Retry Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateSentriesAdded` | Added Sentries Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateSentriesRemoved` | Removed Sentries Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateUniqChunks` | Processed Unique Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateUniqHashReq` | Unique Hash Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateWriteLockWait` | Write Lock Wait Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|currentGenNum` | Gen Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|currentStaleGenNum` | Current Stale Gen Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyDeleteChunksReq` | Delete Chunk Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyNewDupReq` | New Dup Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyReadLockWait` | Read Lock Wait Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyUniqueHashReq` | Unique Hash Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyWriteLockWait` | Write Lock Wait Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numDeleteChunksReq` | Delete Chunk Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numNewDupReq` | New Dup Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numObjsReported` | Reported Chunk Objects | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numReadLockWait` | Read Lock Wait Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numUniqHashReq` | Unique Hash Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numWriteLockWait` | Write Lock Wait Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateChunkInDeleteChunksReq` | Chunks in Delete Chunks Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateChunkInNewDupReq` | Chunks in New Dup Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateChunkInUniqHashReq` | Chunks in Unique Hash Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDedupHashEntryAdded` | Added Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDedupHashEntryRemoved` | Removed Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDedupHashEntryUpdated` | Updated Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDeleteChunksReq` | Delete Chunk Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDeletedChunks` | Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateHashKeyRemovalEntriesPerGen` | Hash Key Removal Entries per Gen Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateHashKeyRemovalEntriesToScanInStep` | Hash Key Removal Entries to Scan in Latest Step Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateHashKeyRemovalStepsDone` | Steps Done in Current Scan Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateNewDupChunks` | Processed New Dup Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateNewDupReq` | New Dup Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateOldDupChunks` | Processed Old Dup Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateReadLockWait` | Read Lock Wait Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateRetryChunks` | Processed Transient Retry Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateSentriesAdded` | Added Sentries Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateSentriesRemoved` | Removed Sentries Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateUniqChunks` | Processed Unique Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateUniqHashReq` | Unique Hash Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateWriteLockWait` | Write Lock Wait Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
 
-#### `cptvsan|Network|RDT|Cluster Latency` <- `cluster-rdt-network-latency`
+#### `cptvsan|Network|RDT` <- `cluster-rdt-network-latency`
 
 Model kind `VsanClusterRdtLatency`, model label "vSAN Cluster RDT Latency"; identity `cluster_uuid`; objects observed **1**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Network\|RDT\|Cluster Latency\|avgLatency` | RDT Network VNIC Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|minLatency` | RDT Network Cluster Min Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|maxLatency` | RDT Network Cluster Max Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|rxSbSpaceMin` | RDT Network Socket Min Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes | V |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|rxSbSpaceMax` | RDT Network Socket Max Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|rxSbSpaceAvg` | RDT Network Socket Average Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txSbSpaceMin` | RDT Network Socket Min Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes | V |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txSbSpaceMax` | RDT Network Socket Max Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txSbSpaceAvg` | RDT Network Socket Average Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txCtxQMin` | RDT Network Min Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txCtxQMax` | RDT Network Max Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes | V |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txCtxQAvg` | RDT Network Average Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txQLatMin` | RDT Network Min Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txQLatMax` | RDT Network Max Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|txQLatAvg` | RDT Network Average Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|numReadyDelay` | Num ready delay | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Network\|RDT\|Cluster Latency\|kaReset` | Keepalive reset | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Network\|RDT\|avgLatency` | RDT Network VNIC Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Network\|RDT\|minLatency` | RDT Network Cluster Min Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Network\|RDT\|maxLatency` | RDT Network Cluster Max Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Network\|RDT\|rxSbSpaceMin` | RDT Network Socket Min Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes | V |  |
+| `cptvsan\|Network\|RDT\|rxSbSpaceMax` | RDT Network Socket Max Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
+| `cptvsan\|Network\|RDT\|rxSbSpaceAvg` | RDT Network Socket Average Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
+| `cptvsan\|Network\|RDT\|txSbSpaceMin` | RDT Network Socket Min Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes | V |  |
+| `cptvsan\|Network\|RDT\|txSbSpaceMax` | RDT Network Socket Max Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
+| `cptvsan\|Network\|RDT\|txSbSpaceAvg` | RDT Network Socket Average Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
+| `cptvsan\|Network\|RDT\|txCtxQMin` | RDT Network Min Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
+| `cptvsan\|Network\|RDT\|txCtxQMax` | RDT Network Max Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes | V |  |
+| `cptvsan\|Network\|RDT\|txCtxQAvg` | RDT Network Average Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
+| `cptvsan\|Network\|RDT\|txQLatMin` | RDT Network Min Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Network\|RDT\|txQLatMax` | RDT Network Max Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Network\|RDT\|txQLatAvg` | RDT Network Average Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Network\|RDT\|numReadyDelay` | Num ready delay | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Network\|RDT\|kaReset` | Keepalive reset | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+
+#### `cptvsan|PMEM` <- `cluster-pmem`
+
+Model kind `VsanClusterPmem`, model label "vSAN Cluster PMem"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|PMEM\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
+| `cptvsan\|PMEM\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
+| `cptvsan\|PMEM\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
+| `cptvsan\|PMEM\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|PMEM\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|PMEM\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|PMEM\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ns |  |  |
+| `cptvsan\|PMEM\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ns |  |  |
 
 #### `cptvsan|Resync` <- `cluster-resync`
 
@@ -1396,651 +1378,774 @@ Model kind `VsanClusterResync`, model label "vSAN Cluster Resync"; identity `clu
 | `cptvsan\|Resync\|tputResyncWritePolicy` | Policy Change Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
 | `cptvsan\|Resync\|tputResyncWriteRebalance` | Rebalance Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
 
-#### `cptvsan|Services|Data Protection` <- `vsan-dp-historical-stats`
-
-Model kind `VsanDpHistoricalStats`, model label "Vsan Dp Historical Stats"; identity `cluster_uuid`; objects observed **1**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|Data Protection\|totalSnapshotCapacity` | Used By Snapshots | schema | unit unknown | none (no HCIBench entry, no name rule) | size_bytes |  |  |
-
-#### `cptvsan|Services|PMEM` <- `cluster-pmem`
-
-Model kind `VsanClusterPmem`, model label "vSAN Cluster PMem"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|PMEM\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
-| `cptvsan\|Services\|PMEM\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
-| `cptvsan\|Services\|PMEM\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
-| `cptvsan\|Services\|PMEM\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|PMEM\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|PMEM\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|PMEM\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ns |  |  |
-| `cptvsan\|Services\|PMEM\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ns |  |  |
-
-#### `cptvsan|Storage I/O|DOM Client` <- `cluster-domclient`
+#### `cptvsan|Storage I/O:dom-client` <- `cluster-domclient`
 
 Model kind `VsanClusterDomclient`, model label "Cluster Domclient"; identity `cluster_uuid`; objects observed **1**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|DOM Client\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-client\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-client\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-client\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-client\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-client\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-client\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-client\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-client\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-client\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
 
-#### `cptvsan|Storage I/O|DOM Component Manager` <- `cluster-domcompmgr`
+#### `cptvsan|Storage I/O:dom-compmgr` <- `cluster-domcompmgr`
 
 Model kind `VsanClusterDomcompmgr`, model label "Cluster Domcompmgr"; identity `cluster_uuid`; objects observed **1**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsRecWrite` | Recovery Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughputRecWrite` | Recovery Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgRecWrite` | Recovery Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latAvgResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsRecWrite` | Recovery Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughputRecWrite` | Recovery Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgRecWrite` | Recovery Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latAvgResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
 
-#### `cptvsan|Storage I/O|DOM Owner` <- `cluster-domowner`
+#### `cptvsan|Storage I/O:dom-owner` <- `cluster-domowner`
 
 Model kind `VsanClusterDomowner`, model label "Cluster Domowner"; identity `cluster_uuid`; objects observed **1**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|DOM Owner\|avgResyncParallelism` | Resync parallelism (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteResyncOps` | Num complete resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteResyncRwrBatches` | Num complete resync rwr batches | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteRwrOps` | Num complete rwr ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numInflightPriorityResyncJobs` | Num inflight priority resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numInflightSharedResyncJobs` | Num inflight shared resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingDecomResyncJobs` | Num pending decom resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingResyncJobs` | Num pending resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numRunningResyncJobs` | Num running resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedPriorityResyncJobs` | Num suspended priority resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedResyncChangemaps` | Num suspended resync changemaps | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedResyncJobs` | Num suspended resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedSharedResyncJobs` | Num suspended shared resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|avgDeltaCreationDomActiveLatency` | Delta creation DOM active latency (average) | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|avgDeltaCreationDomCreationLatency` | Delta creation DOM creation latency (average) | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteDeltaToBaseResyncOps` | Num complete delta to base resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteFullResyncOps` | Num complete full resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteSiblingToDeltaResyncOps` | Num complete sibling to delta resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingDeltaToBaseResyncJobs` | Num pending delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingFullResyncJobs` | Num pending full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingSiblingToDeltaResyncJobs` | Num pending sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numRunningDeltaToBaseResyncJobs` | Num running delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numRunningFullResyncJobs` | Num running full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numRunningSiblingToDeltaResyncJobs` | Num running sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedDeltaToBaseResyncJobs` | Num suspended delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedFullResyncJobs` | Num suspended full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedSiblingToDeltaResyncJobs` | Num suspended sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|totalDeltasCreatedCount` | Deltas created count (total) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputRead` | Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputWrite` | Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsRecWrite` | Recovery Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputRecWrite` | Recovery Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgRecWrite` | Recovery Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|avgResyncParallelism` | Resync parallelism (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteResyncOps` | Num complete resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteResyncRwrBatches` | Num complete resync rwr batches | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteRwrOps` | Num complete rwr ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numInflightPriorityResyncJobs` | Num inflight priority resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numInflightSharedResyncJobs` | Num inflight shared resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingDecomResyncJobs` | Num pending decom resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingResyncJobs` | Num pending resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numRunningResyncJobs` | Num running resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedPriorityResyncJobs` | Num suspended priority resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedResyncChangemaps` | Num suspended resync changemaps | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedResyncJobs` | Num suspended resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedSharedResyncJobs` | Num suspended shared resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|avgDeltaCreationDomActiveLatency` | Delta creation DOM active latency (average) | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|avgDeltaCreationDomCreationLatency` | Delta creation DOM creation latency (average) | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteDeltaToBaseResyncOps` | Num complete delta to base resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteFullResyncOps` | Num complete full resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteSiblingToDeltaResyncOps` | Num complete sibling to delta resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingDeltaToBaseResyncJobs` | Num pending delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingFullResyncJobs` | Num pending full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingSiblingToDeltaResyncJobs` | Num pending sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numRunningDeltaToBaseResyncJobs` | Num running delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numRunningFullResyncJobs` | Num running full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numRunningSiblingToDeltaResyncJobs` | Num running sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedDeltaToBaseResyncJobs` | Num suspended delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedFullResyncJobs` | Num suspended full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedSiblingToDeltaResyncJobs` | Num suspended sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|totalDeltasCreatedCount` | Deltas created count (total) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputRead` | Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputWrite` | Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsRecWrite` | Recovery Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputRecWrite` | Recovery Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgRecWrite` | Recovery Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
 
-#### `cptvsan|Storage I/O|Remote DOM Client` <- `cluster-remotedomclient`
+#### `cptvsan|Storage I/O:remote-dom-client` <- `cluster-remotedomclient`
 
 Model kind `VsanClusterRemotedomclient`, model label "vSAN Cluster Remotedomclient"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|Remote DOM Client\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
 
-#### `cptvsan|Storage I/O|Remote DOM Client (Compute)` <- `computeCluster-remotedomclient`
+#### `cptvsan|Storage I/O:remote-dom-client-compute` <- `computeCluster-remotedomclient`
 
 Model kind `VsanComputeClusterRemotedomclient`, model label "vSAN ComputeCluster Remotedomclient"; identity `cluster_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
 
-#### `cptvsan|zDOM|Top Stats` <- `cluster-zdom-top-stats`
+#### `cptvsan|zDOM` <- `cluster-zdom-top-stats`
 
 Model kind `VsanClusterZdomTopStats`, model label "Cluster Zdom Top Stats"; identity `cluster_uuid`; objects observed **1**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|zDOM\|Top Stats\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|zDOM\|Top Stats\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|zDOM\|Top Stats\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|zDOM\|Top Stats\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|zDOM\|Top Stats\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|zDOM\|Top Stats\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|zDOM\|Top Stats\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|zDOM\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|zDOM\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|zDOM\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|zDOM\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|zDOM\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|zDOM\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|zDOM\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|zDOM\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|zDOM\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
 
 ### 7.2 Host (HostSystem)
 
-#### `cptvsan|CPU|Core:{cpu}` <- `host-cpu`
-
-Model kind `VsanHostCpu`, model label "vSAN Host CPU"; identity `host_uuid`, `cpu`; objects observed **244**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|CPU\|Core:{cpu}\|coreUtilPct` | Percentage of CPU core uitilization | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
-| `cptvsan\|CPU\|Core:{cpu}\|pcpuUtilPct` | Percentage of Physical CPU Utilization | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
-| `cptvsan\|CPU\|Core:{cpu}\|pcpuUsedPct` | Percentage of Used Physical CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
-
-#### `cptvsan|CPU|DOM World:{world_name}-{world_id}` <- `dom-world-cpu`
+#### `cptvsan|CPU:dom-{world_name}-{world_id}` <- `dom-world-cpu`
 
 Model kind `VsanDomWorld`, model label "vSAN DOM World"; identity `host_uuid`, `world_name`, `world_id`; objects observed **315**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|CPU\|DOM World:{world_name}-{world_id}\|usedPct` | Percentage of Used CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
-| `cptvsan\|CPU\|DOM World:{world_name}-{world_id}\|readyPct` | Percentage of Ready CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
-| `cptvsan\|CPU\|DOM World:{world_name}-{world_id}\|runPct` | Percentage of Running CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|CPU:dom-{world_name}-{world_id}\|usedPct` | Percentage of Used CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
+| `cptvsan\|CPU:dom-{world_name}-{world_id}\|readyPct` | Percentage of Ready CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
+| `cptvsan\|CPU:dom-{world_name}-{world_id}\|runPct` | Percentage of Running CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
 
-#### `cptvsan|CPU|LSOM World:{world_name}-{world_id}` <- `lsom-world-cpu`
+#### `cptvsan|CPU:core-{cpu}` <- `host-cpu`
+
+Model kind `VsanHostCpu`, model label "vSAN Host CPU"; identity `host_uuid`, `cpu`; objects observed **244**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|CPU:core-{cpu}\|coreUtilPct` | Percentage of CPU core uitilization | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
+| `cptvsan\|CPU:core-{cpu}\|pcpuUtilPct` | Percentage of Physical CPU Utilization | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
+| `cptvsan\|CPU:core-{cpu}\|pcpuUsedPct` | Percentage of Used Physical CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
+
+#### `cptvsan|CPU:lsom-{world_name}-{world_id}` <- `lsom-world-cpu`
 
 Model kind `VsanLsomWorldCpu`, model label "vSAN LSOM World CPU"; identity `host_uuid`, `world_name`, `world_id`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|CPU\|LSOM World:{world_name}-{world_id}\|readyPct` | Percentage of Ready CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
-| `cptvsan\|CPU\|LSOM World:{world_name}-{world_id}\|usedPct` | Percentage of Used CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
+| `cptvsan\|CPU:lsom-{world_name}-{world_id}\|readyPct` | Percentage of Ready CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
+| `cptvsan\|CPU:lsom-{world_name}-{world_id}\|usedPct` | Percentage of Used CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
 
-#### `cptvsan|CPU|vSAN` <- `vsan-cpu`
+#### `cptvsan|CPU:vsan` <- `vsan-cpu`
 
 Model kind `VsanCpu`, model label "vSAN CPU"; identity `host_uuid`; objects observed **4**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|CPU\|vSAN\|usedPct` | Percentage of Used CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage | V |  |
-| `cptvsan\|CPU\|vSAN\|readyPct` | Percentage of Ready CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage | V |  |
-| `cptvsan\|CPU\|vSAN\|runPct` | Percentage of Running CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage | V |  |
-| `cptvsan\|CPU\|vSAN\|avgUsedPct` | Used percent (average) | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|CPU\|vSAN\|avgRunPct` | Run percent (average) | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|CPU\|vSAN\|maxUsedPct` | Used percent (max) | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|CPU\|vSAN\|maxRunPct` | Run percent (max) | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|CPU:vsan\|usedPct` | Percentage of Used CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage | V |  |
+| `cptvsan\|CPU:vsan\|readyPct` | Percentage of Ready CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage | V |  |
+| `cptvsan\|CPU:vsan\|runPct` | Percentage of Running CPU Time | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage | V |  |
+| `cptvsan\|CPU:vsan\|avgUsedPct` | Used percent (average) | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|CPU:vsan\|avgRunPct` | Run percent (average) | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|CPU:vsan\|maxUsedPct` | Used percent (max) | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|CPU:vsan\|maxRunPct` | Run percent (max) | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - | V |  |
 
-#### `cptvsan|Disks|ESA Disk:{disk_uuid}` <- `vsan-esa-disk-layer`
-
-Model kind `VsanEsaDiskLayer`, model label "Vsan Esa Disk Layer"; identity `disk_uuid`; objects observed **7**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|tputReadPerf` | Throughput read perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|tputReadDiskPerf` | Throughput read disk perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|avgLatReadPerf` | Latency read perf (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsReadPerf` | IOPS read perf | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|maxReadTimePerf` | Read time perf (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|minReadTimePerf` | Read time perf (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|tputWritePerf` | Throughput write perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|avgLatWritePerf` | Latency write perf (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsWritePerf` | IOPS write perf | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|maxWriteTimePerf` | Write time perf (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|minWriteTimePerf` | Write time perf (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|tputReadCapacity` | vSAN Layer Read Throughput of vSAN ESA Disk | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|tputReadDiskCapacity` | Throughput read disk capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|avgLatReadCapacity` | vSAN Layer Average Read Latency of vSAN ESA Disk | schema | unit unknown | none (no HCIBench entry, no name rule) | time_ms | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsReadCapacity` | vSAN Layer Read IOPS of vSAN ESA Disk | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|maxReadTimeCapacity` | Read time capacity (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|minReadTimeCapacity` | Read time capacity (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|tputWriteCapacity` | vSAN Layer Write Throughput of vSAN ESA Disk | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|avgLatWriteCapacity` | vSAN Layer Average Write Latency of vSAN ESA Disk | schema | unit unknown | none (no HCIBench entry, no name rule) | time_ms | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsWriteCapacity` | vSAN Layer Write IOPS of vSAN ESA Disk | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|maxWriteTimeCapacity` | Write time capacity (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|minWriteTimeCapacity` | Write time capacity (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsUnmapPerf` | IOPS unmap perf | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|tputUnmapPerf` | Throughput unmap perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|avgLatUnmapPerf` | Latency unmap perf (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|maxUnmapTimePerf` | Unmap time perf (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|minUnmapTimePerf` | Unmap time perf (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsUnmapCapacity` | IOPS unmap capacity | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|tputUnmapCapacity` | Throughput unmap capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|avgLatUnmapCapacity` | Latency unmap capacity (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|maxUnmapTimeCapacity` | Unmap time capacity (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|minUnmapTimeCapacity` | Unmap time capacity (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|readCountPerf` | Read count perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|writeCountPerf` | Write count perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|readCountCapacity` | Read count capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|writeCountCapacity` | Write count capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|unmapCountPerf` | Unmap count perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|unmapCountCapacity` | Unmap count capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-
-#### `cptvsan|Disks|ESA Disk:{disk_uuid}` <- `vsan-esa-disk-scsifw`
-
-Model kind `VsanEsaDiskScsifw`, model label "Vsan Esa Disk Scsifw"; identity `disk_uuid`; objects observed **7**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|ioCountDevRead` | IO count dev (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|ioCountDevWrite` | IO count dev (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|latencyDevDAvg` | Device Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|latencyDevGAvg` | Guest Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|latencyDevKAvg` | Latency dev k (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|outstandingCmdCount` | Outstanding cmd count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|iopsDevUnmap` | IOPS dev unmap | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|throughputDevUnmap` | Throughput dev unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|latencyDevUnmap` | Latency dev unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Disks\|ESA Disk:{disk_uuid}\|ioCountDevUnmap` | IO count dev unmap | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-
-#### `cptvsan|Disks|Health:{disk_uuid}` <- `ddh-disk`
-
-Model kind `VsanDdhDisk`, model label "vSAN Disk Health Disk"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgReadIOPS` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgReadLatency` | Read Latency | schema | `TIME.NANOSECONDS` | HCIBench `ns` | time_ms |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgReadTPut` | Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgUnmapIOPS` | Unmapped IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgUnmapLatency` | Unmapped Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgUnmapTPut` | Unmapped Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgWriteIOPS` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgWriteLatency` | Write Latency | schema | `TIME.NANOSECONDS` | HCIBench `ns` | time_ms |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|avgWriteTPut` | Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|Disks\|Health:{disk_uuid}\|logCongestion` | Log Congestion | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-
-#### `cptvsan|Disks|OSA|Cache Disk:{disk_uuid}` <- `cache-disk`
+#### `cptvsan|Disk:{disk_uuid}` <- `cache-disk`
 
 Model kind `VsanCacheDisk`, model label "vSAN Cache Disk"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}\|latencyDevDAvg` | Device Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}\|latencyDevGAvg` | Guest Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevDAvg` | Device Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevGAvg` | Guest Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
 
-#### `cptvsan|Disks|OSA|Capacity Disk:{disk_uuid}` <- `capacity-disk`
+#### `cptvsan|Disk:{disk_uuid}` <- `capacity-disk`
 
 Model kind `VsanCapacityDisk`, model label "vSAN Capacity Disk"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|deleteCongestion` | vSAN Layer Delete Congestion | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | number | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|latencyDevDAvg` | Device Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|latencyDevGAvg` | Guest Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|deleteCongestion` | vSAN Layer Delete Congestion | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevDAvg` | Device Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevGAvg` | Guest Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
 
-#### `cptvsan|Disks|OSA|Disk Group:{disk_uuid}` <- `disk-group`
+#### `cptvsan|Disk:{disk_uuid}` <- `clom-disk`
+
+Model kind `VsanClomDisk`, model label "vSAN CLOM Disk"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Disk:{disk_uuid}\|diskCompCntRatio` | Disk Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|diskDataCompCntRatio` | Disk Data Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|diskgrpDataCompCntRatio` | Diskgroup data Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+
+#### `cptvsan|Disk:{disk_uuid}` <- `ddh-disk`
+
+Model kind `VsanDdhDisk`, model label "vSAN Disk Health Disk"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Disk:{disk_uuid}\|avgReadIOPS` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgReadLatency` | Read Latency | schema | `TIME.NANOSECONDS` | HCIBench `ns` | time_ms |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgReadTPut` | Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgUnmapIOPS` | Unmapped IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgUnmapLatency` | Unmapped Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgUnmapTPut` | Unmapped Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgWriteIOPS` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgWriteLatency` | Write Latency | schema | `TIME.NANOSECONDS` | HCIBench `ns` | time_ms |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgWriteTPut` | Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|logCongestion` | Log Congestion | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+
+#### `cptvsan|Disk:{disk_uuid}` <- `vsan-esa-disk-layer`
+
+Model kind `VsanEsaDiskLayer`, model label "Vsan Esa Disk Layer"; identity `disk_uuid`; objects observed **7**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Disk:{disk_uuid}\|tputReadPerf` | Throughput read perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|tputReadDiskPerf` | Throughput read disk perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgLatReadPerf` | Latency read perf (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsReadPerf` | IOPS read perf | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|maxReadTimePerf` | Read time perf (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|minReadTimePerf` | Read time perf (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|tputWritePerf` | Throughput write perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgLatWritePerf` | Latency write perf (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsWritePerf` | IOPS write perf | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|maxWriteTimePerf` | Write time perf (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|minWriteTimePerf` | Write time perf (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|tputReadCapacity` | vSAN Layer Read Throughput of vSAN ESA Disk | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|tputReadDiskCapacity` | Throughput read disk capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgLatReadCapacity` | vSAN Layer Average Read Latency of vSAN ESA Disk | schema | unit unknown | none (no HCIBench entry, no name rule) | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsReadCapacity` | vSAN Layer Read IOPS of vSAN ESA Disk | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|maxReadTimeCapacity` | Read time capacity (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|minReadTimeCapacity` | Read time capacity (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|tputWriteCapacity` | vSAN Layer Write Throughput of vSAN ESA Disk | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgLatWriteCapacity` | vSAN Layer Average Write Latency of vSAN ESA Disk | schema | unit unknown | none (no HCIBench entry, no name rule) | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsWriteCapacity` | vSAN Layer Write IOPS of vSAN ESA Disk | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|maxWriteTimeCapacity` | Write time capacity (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|minWriteTimeCapacity` | Write time capacity (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsUnmapPerf` | IOPS unmap perf | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|tputUnmapPerf` | Throughput unmap perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgLatUnmapPerf` | Latency unmap perf (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|maxUnmapTimePerf` | Unmap time perf (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|minUnmapTimePerf` | Unmap time perf (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsUnmapCapacity` | IOPS unmap capacity | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|tputUnmapCapacity` | Throughput unmap capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|avgLatUnmapCapacity` | Latency unmap capacity (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|maxUnmapTimeCapacity` | Unmap time capacity (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|minUnmapTimeCapacity` | Unmap time capacity (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|readCountPerf` | Read count perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|writeCountPerf` | Write count perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|readCountCapacity` | Read count capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|writeCountCapacity` | Write count capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|unmapCountPerf` | Unmap count perf | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|unmapCountCapacity` | Unmap count capacity | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+
+#### `cptvsan|Disk:{disk_uuid}` <- `vsan-esa-disk-scsifw`
+
+Model kind `VsanEsaDiskScsifw`, model label "Vsan Esa Disk Scsifw"; identity `disk_uuid`; objects observed **7**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Disk:{disk_uuid}\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|ioCountDevRead` | IO count dev (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|ioCountDevWrite` | IO count dev (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevDAvg` | Device Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevGAvg` | Guest Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevKAvg` | Latency dev k (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Disk:{disk_uuid}\|outstandingCmdCount` | Outstanding cmd count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|iopsDevUnmap` | IOPS dev unmap | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|throughputDevUnmap` | Throughput dev unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|latencyDevUnmap` | Latency dev unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Disk:{disk_uuid}\|ioCountDevUnmap` | IO count dev unmap | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+
+#### `cptvsan|Disk Group:{disk_uuid}` <- `disk-group`
 
 Model kind `VsanDiskGroup`, model label "vSAN Disk Group"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|componentCongestionReadSched` | Read Component | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|componentCongestionWriteSched` | Write Component | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|diskgroupCongestionReadSched` | Read Disk Group | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|diskgroupCongestionWriteSched` | Write Disk Group | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsDelayPctSched` | IO Delay Percentage | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsDirectSched` | Direct Scheduled IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncReadDecom` | Evacuation Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncReadFixComp` | Repair Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncReadPolicy` | Policy Change Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncReadRebalance` | Rebalance Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncWrite` | Resync Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncWriteDecom` | Evacuation Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncWriteFixComp` | Repair Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncWritePolicy` | Policy Change Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|iopsResyncWriteRebalance` | Rebalance Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncReadDecom` | Evacuation Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncReadFixComp` | Repair Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncReadPolicy` | Policy Change Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncReadRebalance` | Rebalance Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncWrite` | Resync Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncWriteDecom` | Evacuation Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncWriteFixComp` | Repair Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncWritePolicy` | Policy Change Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latResyncWriteRebalance` | Rebalance Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|latencySched` | Scheduled Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|outstandingBytesSched` | Outstanding Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncReadDecom` | Evacuation Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncReadFixComp` | Repair Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncReadPolicy` | Policy Change Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncReadRebalance` | Rebalance Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncWrite` | Resync Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncWriteDecom` | Evacuation Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncWriteFixComp` | Repair Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncWritePolicy` | Policy Change Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}\|tputResyncWriteRebalance` | Rebalance Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|componentCongestionReadSched` | Read Component | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|componentCongestionWriteSched` | Write Component | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|diskgroupCongestionReadSched` | Read Disk Group | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|diskgroupCongestionWriteSched` | Write Disk Group | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsDelayPctSched` | IO Delay Percentage | schema | `RATIO.PERCENT` | HCIBench `percent` | percentage |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsDirectSched` | Direct Scheduled IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncReadDecom` | Evacuation Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncReadFixComp` | Repair Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncReadPolicy` | Policy Change Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncReadRebalance` | Rebalance Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncWrite` | Resync Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncWriteDecom` | Evacuation Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncWriteFixComp` | Repair Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncWritePolicy` | Policy Change Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|iopsResyncWriteRebalance` | Rebalance Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncReadDecom` | Evacuation Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncReadFixComp` | Repair Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncReadPolicy` | Policy Change Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncReadRebalance` | Rebalance Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncWrite` | Resync Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncWriteDecom` | Evacuation Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncWriteFixComp` | Repair Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncWritePolicy` | Policy Change Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latResyncWriteRebalance` | Rebalance Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|latencySched` | Scheduled Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|outstandingBytesSched` | Outstanding Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncReadDecom` | Evacuation Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncReadFixComp` | Repair Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncReadPolicy` | Policy Change Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncReadRebalance` | Rebalance Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncWrite` | Resync Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncWriteDecom` | Evacuation Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncWriteFixComp` | Repair Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncWritePolicy` | Policy Change Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Disk Group:{disk_uuid}\|tputResyncWriteRebalance` | Rebalance Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
 
-#### `cptvsan|ESA Dedup|Chunk Service` <- `host-esa-dedup-store-chunksvc`
-
-Model kind `VsanHostEsaDedupStoreChunksvc`, model label "vSAN Host ESA Dedup Store Chunksvc"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyChangeRefCount` | Change Ref Count Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyDeleteChunkExtent` | Delete Chunk Extent Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyDeletedObjCleanup` | Deleted Object Clean Up Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyGetChunkEntries` | Get Chunk Entries Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|latencyReserveMba` | Reserve MBA Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numChangeRefCount` | Change Ref Count Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numDeleteChunkExtent` | Delete Chunk Extent Request Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numDeletedObjCleanup` | Deleted Object Clean Up Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numGetChunkEntries` | Get Chunk Entries Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numObjsReported` | Reported Chunk Objects | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|numReserveMba` | Reserve MBA Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateBlocksInChunkDeleted` | Blocks in Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateBlocksInChunkWritten` | Blocks in Written Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChangeRefCount` | Change Ref Count Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunkRefEntAdded` | Added Chunk Ref Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunkRefEntRemoved` | Removed Chunk Ref Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksDeleted` | Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksInChangeRefCount` | Chunks in Change Ref Count Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksInDeleteChunkExtent` | Chunks in Delete Chunk Extent Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksInGetChunkEntries` | Chunks in Get Chunk Entries Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateChunksWritten` | Write Chunk Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateDeleteChunkExtent` | Delete Chunk Extent Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateDeletedObjCleanup` | Deleted Object Clean Up Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateGetChunkEntries` | Get Chunk Entries Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|rateReserveMba` | Reserve MBA Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|totalNumBlks` | Total Number of Blocks of All Chunks | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Chunk Service\|totalNumRefCnt` | Total Ref Count of All Chunks | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-
-#### `cptvsan|ESA Dedup|DOM Client I/O` <- `host-esa-dedup-domclient-io`
+#### `cptvsan|ESA Dedup:dom-client-io` <- `host-esa-dedup-domclient-io`
 
 Model kind `VsanHostEsaDedupDomclientIo`, model label "vSAN Host ESA Dedup Domclient IO"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
-| `cptvsan\|ESA Dedup\|DOM Client I/O\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
+| `cptvsan\|ESA Dedup:dom-client-io\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes | V |  |
 
-#### `cptvsan|ESA Dedup|DOM Component Manager I/O` <- `host-esa-dedup-domcompmgr-io`
+#### `cptvsan|ESA Dedup:dom-compmgr-io` <- `host-esa-dedup-domcompmgr-io`
 
 Model kind `VsanHostEsaDedupDomcompmgrIo`, model label "vSAN Host ESA Dedup Domcompmgr IO"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Component Manager I/O\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-compmgr-io\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
 
-#### `cptvsan|ESA Dedup|DOM Owner I/O` <- `host-esa-dedup-domowner-io`
+#### `cptvsan|ESA Dedup:dom-owner-io` <- `host-esa-dedup-domowner-io`
 
 Model kind `VsanHostEsaDedupDomownerIo`, model label "vSAN Host ESA Dedup Domowner IO"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
-| `cptvsan\|ESA Dedup\|DOM Owner I/O\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupChunkReadCount` | Deduplication Chunk Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupChunkWriteCount` | Deduplication Chunk Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupEngineReadCount` | Deduplication Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupEngineWriteCount` | Deduplication Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupHashReadCount` | Deduplication Hash Object Read IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|dedupHashWriteCount` | Deduplication Hash Object Write IO Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupChunkObjRead` | Deduplication Chunk Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupChunkObjWrite` | Deduplication Chunk Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupEngineRead` | Deduplication Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupEngineWrite` | Deduplication Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupHashObjRead` | Deduplication Hash Object Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|iopsDedupHashObjWrite` | Deduplication Hash Object Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupChunkObjRead` | Deduplication Chunk Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupChunkObjWrite` | Deduplication Chunk Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupEngineRead` | Deduplication Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupEngineWrite` | Deduplication Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupHashObjRead` | Deduplication Hash Object Read Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|latencyAvgDedupHashObjWrite` | Deduplication Hash Object Write Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupChunkObjRead` | Deduplication Chunk Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupChunkObjWrite` | Deduplication Chunk Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupEngineRead` | Deduplication Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupEngineWrite` | Deduplication Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupHashObjRead` | Deduplication Hash Object Read Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
+| `cptvsan\|ESA Dedup:dom-owner-io\|tputDedupHashObjWrite` | Deduplication Hash Object Write Throughput | schema | unit unknown | none (no HCIBench entry, no name rule) | rate_bytes |  |  |
 
-#### `cptvsan|ESA Dedup|Hash Service` <- `host-esa-dedup-store-hashsvc`
+#### `cptvsan|ESA Dedup:chunk-service` <- `host-esa-dedup-store-chunksvc`
+
+Model kind `VsanHostEsaDedupStoreChunksvc`, model label "vSAN Host ESA Dedup Store Chunksvc"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|ESA Dedup:chunk-service\|latencyChangeRefCount` | Change Ref Count Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|latencyDeleteChunkExtent` | Delete Chunk Extent Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|latencyDeletedObjCleanup` | Deleted Object Clean Up Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|latencyGetChunkEntries` | Get Chunk Entries Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|latencyReserveMba` | Reserve MBA Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numChangeRefCount` | Change Ref Count Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numDeleteChunkExtent` | Delete Chunk Extent Request Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numDeletedObjCleanup` | Deleted Object Clean Up Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numGetChunkEntries` | Get Chunk Entries Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numObjsReported` | Reported Chunk Objects | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|numReserveMba` | Reserve MBA Request | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateBlocksInChunkDeleted` | Blocks in Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateBlocksInChunkWritten` | Blocks in Written Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChangeRefCount` | Change Ref Count Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunkRefEntAdded` | Added Chunk Ref Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunkRefEntRemoved` | Removed Chunk Ref Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksDeleted` | Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksInChangeRefCount` | Chunks in Change Ref Count Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksInDeleteChunkExtent` | Chunks in Delete Chunk Extent Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksInGetChunkEntries` | Chunks in Get Chunk Entries Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateChunksWritten` | Write Chunk Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateDeleteChunkExtent` | Delete Chunk Extent Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateDeletedObjCleanup` | Deleted Object Clean Up Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateGetChunkEntries` | Get Chunk Entries Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|rateReserveMba` | Reserve MBA Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|totalNumBlks` | Total Number of Blocks of All Chunks | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:chunk-service\|totalNumRefCnt` | Total Ref Count of All Chunks | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+
+#### `cptvsan|ESA Dedup:hash-service` <- `host-esa-dedup-store-hashsvc`
 
 Model kind `VsanHostEsaDedupStoreHashsvc`, model label "vSAN Host ESA Dedup Store Hashsvc"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|ESA Dedup\|Hash Service\|currentGenNum` | Gen Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|currentStaleGenNum` | Current Stale Gen Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyDeleteChunksReq` | Delete Chunk Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyNewDupReq` | New Dup Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyReadLockWait` | Read Lock Wait Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyUniqueHashReq` | Unique Hash Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|latencyWriteLockWait` | Write Lock Wait Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numDeleteChunksReq` | Delete Chunk Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numNewDupReq` | New Dup Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numObjsReported` | Reported Chunk Objects | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numReadLockWait` | Read Lock Wait Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numUniqHashReq` | Unique Hash Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|numWriteLockWait` | Write Lock Wait Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateChunkInDeleteChunksReq` | Chunks in Delete Chunks Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateChunkInNewDupReq` | Chunks in New Dup Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateChunkInUniqHashReq` | Chunks in Unique Hash Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDedupHashEntryAdded` | Added Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDedupHashEntryRemoved` | Removed Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDedupHashEntryUpdated` | Updated Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDeleteChunksReq` | Delete Chunk Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateDeletedChunks` | Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateHashKeyRemovalEntriesPerGen` | Hash Key Removal Entries per Gen Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateHashKeyRemovalEntriesToScanInStep` | Hash Key Removal Entries to Scan in Latest Step Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateHashKeyRemovalStepsDone` | Steps Done in Current Scan Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateNewDupChunks` | Processed New Dup Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateNewDupReq` | New Dup Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateOldDupChunks` | Processed Old Dup Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateReadLockWait` | Read Lock Wait Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateRetryChunks` | Processed Transient Retry Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateSentriesAdded` | Added Sentries Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateSentriesRemoved` | Removed Sentries Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateUniqChunks` | Processed Unique Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateUniqHashReq` | Unique Hash Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
-| `cptvsan\|ESA Dedup\|Hash Service\|rateWriteLockWait` | Write Lock Wait Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|currentGenNum` | Gen Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|currentStaleGenNum` | Current Stale Gen Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyDeleteChunksReq` | Delete Chunk Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyNewDupReq` | New Dup Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyReadLockWait` | Read Lock Wait Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyUniqueHashReq` | Unique Hash Request Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|latencyWriteLockWait` | Write Lock Wait Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numDeleteChunksReq` | Delete Chunk Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numNewDupReq` | New Dup Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numObjsReported` | Reported Chunk Objects | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numReadLockWait` | Read Lock Wait Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numUniqHashReq` | Unique Hash Request Count | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|numWriteLockWait` | Write Lock Wait Number | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateChunkInDeleteChunksReq` | Chunks in Delete Chunks Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateChunkInNewDupReq` | Chunks in New Dup Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateChunkInUniqHashReq` | Chunks in Unique Hash Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDedupHashEntryAdded` | Added Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDedupHashEntryRemoved` | Removed Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDedupHashEntryUpdated` | Updated Dedup Hash Map Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDeleteChunksReq` | Delete Chunk Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateDeletedChunks` | Deleted Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateHashKeyRemovalEntriesPerGen` | Hash Key Removal Entries per Gen Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateHashKeyRemovalEntriesToScanInStep` | Hash Key Removal Entries to Scan in Latest Step Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateHashKeyRemovalStepsDone` | Steps Done in Current Scan Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateNewDupChunks` | Processed New Dup Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateNewDupReq` | New Dup Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateOldDupChunks` | Processed Old Dup Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateReadLockWait` | Read Lock Wait Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateRetryChunks` | Processed Transient Retry Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateSentriesAdded` | Added Sentries Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateSentriesRemoved` | Removed Sentries Entries Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateUniqChunks` | Processed Unique Chunks Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateUniqHashReq` | Unique Hash Requests Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
+| `cptvsan\|ESA Dedup:hash-service\|rateWriteLockWait` | Write Lock Wait Per Second | schema | unit unknown | none (no HCIBench entry, no name rule) | number |  |  |
 
-#### `cptvsan|Memory|Heap:{heap_name}` <- `heap-memory`
+#### `cptvsan|File Service` <- `vsan-file-service`
+
+Model kind `VsanFileService`, model label "vSAN File Service"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|File Service\|readLatency` | Read latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|File Service\|readOpTotal` | IOPS for read operations | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|File Service\|readRequested` | Requested bytes for read | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|File Service\|readTransferred` | Actual transferred bytes for read | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|File Service\|writeLatency` | Write latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|File Service\|writeOpTotal` | IOPS for write operations | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|File Service\|writeRequested` | Requested bytes for write | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|File Service\|writeTransferred` | Actual transferred bytes for write | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+
+#### `cptvsan|IOInsight` <- `ioinsight`
+
+Model kind `VsanIoinsight`, model label "vSAN Ioinsight"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|IOInsight\|aligned4kRatio` | 4K Aligned IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|aligned4kReadRatio` | 4K Aligned Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|aligned4kWriteRatio` | 4K Aligned Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|IOInsight\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|IOInsight\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|IOInsight\|randomRatio` | Random IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|randomReadRatio` | Random Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|randomWriteRatio` | Random Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|readRatio` | Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz0_4k` | ReadSize<4K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz128k` | ReadSize=128K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz128k_256k` | 128K<ReadSize<256K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz16k` | ReadSize=16K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz16k_32k` | 16K<ReadSize<32K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz1_m` | ReadSize>1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz1m` | ReadSize=1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz256k` | ReadSize=256K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz256k_512k` | 256K<ReadSize<512K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz32k` | ReadSize=32K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz32k_64k` | 32K<ReadSize<64K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz4k` | ReadSize=4K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz4k_8k` | 4K<ReadSize<8K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz512k` | ReadSize=512K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz512k_1m` | 512K<ReadSize<1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz64k` | ReadSize=64K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz64k_128k` | 64K<ReadSize<128K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz8k` | ReadSize=8K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|riosz8k_16k` | 8K<ReadSize<16K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat0_1us` | 0<ReadLatency<1(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat100_500us` | 100<ReadLatency<500(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat100_ms` | ReadLatency>100(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat10_100us` | 10<ReadLatency<100(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat10_25ms` | 10<ReadLatency<25(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat1_10us` | 1<ReadLatency<10(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat1_5ms` | 1<ReadLatency<5(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat25_50ms` | 25<ReadLatency<50(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat500us_1ms` | 500us<ReadLatency<1ms | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat50_100ms` | 50<ReadLatency<100(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|rlat5_10ms` | 5<ReadLatency<10(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|sequentialRatio` | Sequential IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|sequentialReadRatio` | Sequential Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|sequentialWriteRatio` | Sequential Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|throughputRandom` | Random Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | rate_bytes | V |  |
+| `cptvsan\|IOInsight\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|IOInsight\|throughputSequential` | Sequential Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | rate_bytes | V |  |
+| `cptvsan\|IOInsight\|throughputTotal` | Total Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | rate_bytes | V |  |
+| `cptvsan\|IOInsight\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|IOInsight\|unaligned4kRatio` | 4K Unaligned IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|unaligned4kReadRatio` | 4K Unaligned Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|unaligned4kWriteRatio` | 4K Unaligned Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz0_4k` | WriteSize<4K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz128k` | WriteSize=128K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz128k_256k` | 128K<WriteSize<256K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz16k` | WriteSize=16K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz16k_32k` | 16K<WriteSize<32K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz1_m` | WriteSize>1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz1m` | WriteSize=1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz256k` | WriteSize=256K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz256k_512k` | 256K<WriteSize<512K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz32k` | WriteSize=32K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz32k_64k` | 32K<WriteSize<64K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz4k` | WriteSize=4K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz4k_8k` | 4K<WriteSize<8K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz512k` | WriteSize=512K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz512k_1m` | 512K<WriteSize<1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz64k` | WriteSize=64K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz64k_128k` | 64K<WriteSize<128K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz8k` | WriteSize=8K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wiosz8k_16k` | 8K<WriteSize<16K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat0_1us` | 0<WriteLatency<1(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat100_500us` | 100<WriteLatency<500(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat100_ms` | WriteLatency>100(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat10_100us` | 10<WriteLatency<100(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat10_25ms` | 10<WriteLatency<25(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat1_10us` | 1<WriteLatency<10(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat1_5ms` | 1<WriteLatency<5(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat25_50ms` | 25<WriteLatency<50(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat500us_1ms` | 500us<WriteLatency<1ms | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat50_100ms` | 50<WriteLatency<100(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|wlat5_10ms` | 5<WriteLatency<10(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
+| `cptvsan\|IOInsight\|writeRatio` | Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
+
+#### `cptvsan|Memory:heap-{heap_name}` <- `heap-memory`
 
 Model kind `VsanHeapMemory`, model label "vSAN Heap Memory"; identity `host_uuid`, `heap_name`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Memory\|Heap:{heap_name}\|heapUtil` | Heap Utilization | schema | `RATIO.PERCENT` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|Memory:heap-{heap_name}\|heapUtil` | Heap Utilization | schema | `RATIO.PERCENT` | name rule (_unit_from_name) | number |  |  |
 
-#### `cptvsan|Memory|Slab:{slab_name}` <- `slab-memory`
+#### `cptvsan|Memory:slab-{slab_name}` <- `slab-memory`
 
 Model kind `VsanSlabMemory`, model label "vSAN Slab Memory"; identity `host_uuid`, `slab_name`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Memory\|Slab:{slab_name}\|slabUtil` | Slab Utilization | schema | `RATIO.PERCENT` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|Memory:slab-{slab_name}\|slabUtil` | Slab Utilization | schema | `RATIO.PERCENT` | name rule (_unit_from_name) | number |  |  |
 
-#### `cptvsan|Memory|System` <- `system-mem`
+#### `cptvsan|Memory:system` <- `system-mem`
 
 Model kind `VsanSystemMemory`, model label "vSAN System Memory"; identity `host_uuid`; objects observed **4**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Memory\|System\|totalMbMemUsed` | Total Memory Used | schema | `DATA_SIZE.MEGABYTE` | HCIBench `mbytes` | number |  |  |
-| `cptvsan\|Memory\|System\|pctMemUsed` | Used Memory Percentage | schema | `RATIO.PERCENT` | HCIBench `percent` | permille |  | ÷10 |
-| `cptvsan\|Memory\|System\|overcommitRatio` | Over Commit Ratio | schema | `RATIO.PERCENT` | HCIBench `percentunit` | number |  |  |
+| `cptvsan\|Memory:system\|totalMbMemUsed` | Total Memory Used | schema | `DATA_SIZE.MEGABYTE` | HCIBench `mbytes` | number |  |  |
+| `cptvsan\|Memory:system\|pctMemUsed` | Used Memory Percentage | schema | `RATIO.PERCENT` | HCIBench `percent` | permille |  | ÷10 |
+| `cptvsan\|Memory:system\|overcommitRatio` | Over Commit Ratio | schema | `RATIO.PERCENT` | HCIBench `percentunit` | number |  |  |
 
-#### `cptvsan|Memory|vSAN` <- `vsan-memory`
+#### `cptvsan|Memory:vsan` <- `vsan-memory`
 
 Model kind `VsanMemory`, model label "vSAN Memory"; identity `host_uuid`; objects observed **4**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Memory\|vSAN\|kernelReservedSize` | Kernel Reserved Memory Size | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | number | V |  |
-| `cptvsan\|Memory\|vSAN\|uwReservedSize` | User world Reserved Memory Size | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | number | V |  |
-| `cptvsan\|Memory\|vSAN\|uwConsumedSize` | Uw consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|vsanmgmtdConsumedSize` | Vsanmgmtd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|vsanmgmtdWatchdogConsumedSize` | Vsanmgmtd watchdog consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|clomdConsumedSize` | Clomd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|osfsdConsumedSize` | Osfsd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|cmmdsdConsumedSize` | Cmmdsd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|vitdConsumedSize` | Vitd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsandevicemonitordConsumedSize` | Vsandevicemonitord consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|vsanobserverConsumedSize` | Vsanobserver consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsantracedConsumedSize` | Vsantraced consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|epdConsumedSize` | Epd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|cmmdsTimeMachineConsumedSize` | CMMDS time machine consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanmgmtdReservedSize` | Vsanmgmtd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanmgmtdWatchdogReservedSize` | Vsanmgmtd watchdog reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|clomdReservedSize` | Clomd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|osfsdReservedSize` | Osfsd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|cmmdsdReservedSize` | Cmmdsd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Memory\|vSAN\|vitdReservedSize` | Vitd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsandevicemonitordReservedSize` | Vsandevicemonitord reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanobserverReservedSize` | Vsanobserver reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsantracedReservedSize` | Vsantraced reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|epdReservedSize` | Epd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|cmmdsTimeMachineReservedSize` | CMMDS time machine reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Memory\|vSAN\|uwMemAllocMin` | Uw mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanmgmtdMemAllocMin` | Vsanmgmtd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanmgmtdWatchdogMemAllocMin` | Vsanmgmtd watchdog mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|clomdMemAllocMin` | Clomd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|osfsdMemAllocMin` | Osfsd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|cmmdsdMemAllocMin` | Cmmdsd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vitdMemAllocMin` | Vitd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsandevicemonitordMemAllocMin` | Vsandevicemonitord mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanobserverMemAllocMin` | Vsanobserver mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsantracedMemAllocMin` | Vsantraced mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|epdMemAllocMin` | Epd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|cmmdsTimeMachineMemAllocMin` | CMMDS time machine mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|uwMemAllocMax` | Uw mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanmgmtdMemAllocMax` | Vsanmgmtd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanmgmtdWatchdogMemAllocMax` | Vsanmgmtd watchdog mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|clomdMemAllocMax` | Clomd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|osfsdMemAllocMax` | Osfsd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|cmmdsdMemAllocMax` | Cmmdsd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vitdMemAllocMax` | Vitd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsandevicemonitordMemAllocMax` | Vsandevicemonitord mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsanobserverMemAllocMax` | Vsanobserver mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|vsantracedMemAllocMax` | Vsantraced mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|epdMemAllocMax` | Epd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|cmmdsTimeMachineMemAllocMax` | CMMDS time machine mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Memory\|vSAN\|kernelConsumedSize` | Kernel consumed size | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Memory:vsan\|kernelReservedSize` | Kernel Reserved Memory Size | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | number | V |  |
+| `cptvsan\|Memory:vsan\|uwReservedSize` | User world Reserved Memory Size | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | number | V |  |
+| `cptvsan\|Memory:vsan\|uwConsumedSize` | Uw consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|vsanmgmtdConsumedSize` | Vsanmgmtd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|vsanmgmtdWatchdogConsumedSize` | Vsanmgmtd watchdog consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|clomdConsumedSize` | Clomd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|osfsdConsumedSize` | Osfsd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|cmmdsdConsumedSize` | Cmmdsd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|vitdConsumedSize` | Vitd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|vsandevicemonitordConsumedSize` | Vsandevicemonitord consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|vsanobserverConsumedSize` | Vsanobserver consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|vsantracedConsumedSize` | Vsantraced consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|epdConsumedSize` | Epd consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|cmmdsTimeMachineConsumedSize` | CMMDS time machine consumed size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanmgmtdReservedSize` | Vsanmgmtd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanmgmtdWatchdogReservedSize` | Vsanmgmtd watchdog reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|clomdReservedSize` | Clomd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|osfsdReservedSize` | Osfsd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|cmmdsdReservedSize` | Cmmdsd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Memory:vsan\|vitdReservedSize` | Vitd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|vsandevicemonitordReservedSize` | Vsandevicemonitord reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanobserverReservedSize` | Vsanobserver reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|vsantracedReservedSize` | Vsantraced reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|epdReservedSize` | Epd reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|cmmdsTimeMachineReservedSize` | CMMDS time machine reserved size | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Memory:vsan\|uwMemAllocMin` | Uw mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanmgmtdMemAllocMin` | Vsanmgmtd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanmgmtdWatchdogMemAllocMin` | Vsanmgmtd watchdog mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|clomdMemAllocMin` | Clomd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|osfsdMemAllocMin` | Osfsd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|cmmdsdMemAllocMin` | Cmmdsd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vitdMemAllocMin` | Vitd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsandevicemonitordMemAllocMin` | Vsandevicemonitord mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanobserverMemAllocMin` | Vsanobserver mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsantracedMemAllocMin` | Vsantraced mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|epdMemAllocMin` | Epd mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|cmmdsTimeMachineMemAllocMin` | CMMDS time machine mem alloc (min) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|uwMemAllocMax` | Uw mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanmgmtdMemAllocMax` | Vsanmgmtd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanmgmtdWatchdogMemAllocMax` | Vsanmgmtd watchdog mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|clomdMemAllocMax` | Clomd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|osfsdMemAllocMax` | Osfsd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|cmmdsdMemAllocMax` | Cmmdsd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vitdMemAllocMax` | Vitd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsandevicemonitordMemAllocMax` | Vsandevicemonitord mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsanobserverMemAllocMax` | Vsanobserver mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|vsantracedMemAllocMax` | Vsantraced mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|epdMemAllocMax` | Epd mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|cmmdsTimeMachineMemAllocMax` | CMMDS time machine mem alloc (max) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Memory:vsan\|kernelConsumedSize` | Kernel consumed size | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
 
-#### `cptvsan|Network|CMMDS` <- `cmmds-net`
+#### `cptvsan|Network|Host` <- `cmmds-net`
 
 Model kind `VsanCmmdsNet`, model label "Cmmds Net"; identity `host_uuid`; objects observed **4**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Network\|CMMDS\|rdtRx` | Read Inbound | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Network\|CMMDS\|rdtRxThroughput` | Read Inbound Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Network\|CMMDS\|rdtTx` | Read Outbound | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Network\|CMMDS\|rdtTxThroughput` | Read Outbound Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Network\|CMMDS\|groupRx` | Group Inbound | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Network\|CMMDS\|groupRxThroughput` | Group Inbound Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Network\|CMMDS\|groupTxUcast` | Group Outbound Unicast | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Network\|CMMDS\|groupTxUcastThroughput` | Group Outbound Unicast Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Network\|CMMDS\|groupTxMcast` | Group Outbound Multicast | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Network\|CMMDS\|groupTxMcastThroughput` | Group Outbound Multicast Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Network\|Host\|rdtRx` | Read Inbound | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Network\|Host\|rdtRxThroughput` | Read Inbound Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Network\|Host\|rdtTx` | Read Outbound | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Network\|Host\|rdtTxThroughput` | Read Outbound Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Network\|Host\|groupRx` | Group Inbound | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Network\|Host\|groupRxThroughput` | Group Inbound Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Network\|Host\|groupTxUcast` | Group Outbound Unicast | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Network\|Host\|groupTxUcastThroughput` | Group Outbound Unicast Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Network\|Host\|groupTxMcast` | Group Outbound Multicast | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Network\|Host\|groupTxMcastThroughput` | Group Outbound Multicast Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+
+#### `cptvsan|Network|Host` <- `rdt-net`
+
+Model kind `VsanRdtNet`, model label "vSAN RDT Network"; identity `host_uuid`; objects observed **4**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Network\|Host\|checksumMismatchCount` | RDT Net Checksum Mismatch Count | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+
+#### `cptvsan|Network|Host` <- `rdt-network-latency`
+
+Model kind `VsanRdtLatency`, model label "vSAN RDT Latency"; identity `host_uuid`; objects observed **4**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Network\|Host\|avgLatency` | RDT Network VNIC Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Network\|Host\|minLatency` | RDT Network Cluster Min Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Network\|Host\|maxLatency` | RDT Network Cluster Max Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Network\|Host\|rxSbSpaceMin` | RDT Network Socket Min Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Network\|Host\|rxSbSpaceMax` | RDT Network Socket Max Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Network\|Host\|rxSbSpaceAvg` | RDT Network Socket Average Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|Host\|txSbSpaceMin` | RDT Network Socket Min Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Network\|Host\|txSbSpaceMax` | RDT Network Socket Max Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|Host\|txSbSpaceAvg` | RDT Network Socket Average Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|Host\|txCtxQMin` | RDT Network Min Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|Host\|txCtxQMax` | RDT Network Max Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Network\|Host\|txCtxQAvg` | RDT Network Average Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|Host\|txQLatMin` | RDT Network Min Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Network\|Host\|txQLatMax` | RDT Network Max Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Network\|Host\|txQLatAvg` | RDT Network Average Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Network\|Host\|numReadyDelay` | Num ready delay | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Network\|Host\|kaReset` | Keepalive reset | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
 
 #### `cptvsan|Network|Host` <- `vsan-host-net`
 
@@ -2138,62 +2243,6 @@ Model kind `VsanPnic`, model label "vSAN Physical NIC"; identity `host_uuid`, `v
 | `cptvsan\|Network\|Physical NIC:{vmnic}\|txPktRaw` | TX packet raw | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  | cumulative |
 | `cptvsan\|Network\|Physical NIC:{vmnic}\|rxLossRatio` | no label in source | - | percent (by construction; not declared) | app/push.py formula | - |  | derived |
 
-#### `cptvsan|Network|RDT|Host Latency` <- `rdt-network-latency`
-
-Model kind `VsanRdtLatency`, model label "vSAN RDT Latency"; identity `host_uuid`; objects observed **4**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Network\|RDT\|Host Latency\|avgLatency` | RDT Network VNIC Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|minLatency` | RDT Network Cluster Min Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|maxLatency` | RDT Network Cluster Max Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|rxSbSpaceMin` | RDT Network Socket Min Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|rxSbSpaceMax` | RDT Network Socket Max Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|rxSbSpaceAvg` | RDT Network Socket Average Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txSbSpaceMin` | RDT Network Socket Min Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txSbSpaceMax` | RDT Network Socket Max Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txSbSpaceAvg` | RDT Network Socket Average Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txCtxQMin` | RDT Network Min Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txCtxQMax` | RDT Network Max Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txCtxQAvg` | RDT Network Average Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txQLatMin` | RDT Network Min Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txQLatMax` | RDT Network Max Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|txQLatAvg` | RDT Network Average Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|numReadyDelay` | Num ready delay | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Network\|RDT\|Host Latency\|kaReset` | Keepalive reset | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-
-#### `cptvsan|Network|RDT|Net` <- `rdt-net`
-
-Model kind `VsanRdtNet`, model label "vSAN RDT Network"; identity `host_uuid`; objects observed **4**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Network\|RDT\|Net\|checksumMismatchCount` | RDT Net Checksum Mismatch Count | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-
-#### `cptvsan|Network|RDT|VMkernel Latency:{vmknic}` <- `vnic-rdt-network-latency`
-
-Model kind `VsanVnicRdtLatency`, model label "vSAN VMkernel RDT Latency"; identity `host_uuid`, `vmknic`; objects observed **4**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|avgLatency` | RDT Network VNIC Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|minLatency` | RDT Network Cluster Min Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|maxLatency` | RDT Network Cluster Max Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|rxSbSpaceMin` | RDT Network Socket Min Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|rxSbSpaceMax` | RDT Network Socket Max Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|rxSbSpaceAvg` | RDT Network Socket Average Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txSbSpaceMin` | RDT Network Socket Min Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txSbSpaceMax` | RDT Network Socket Max Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txSbSpaceAvg` | RDT Network Socket Average Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txCtxQMin` | RDT Network Min Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txCtxQMax` | RDT Network Max Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txCtxQAvg` | RDT Network Average Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txQLatMin` | RDT Network Min Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txQLatMax` | RDT Network Max Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|txQLatAvg` | RDT Network Average Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|numReadyDelay` | Num ready delay | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}\|kaReset` | Keepalive reset | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-
 #### `cptvsan|Network|TCP/IP Stack:{stack}` <- `vsan-tcpip-stats`
 
 Model kind `VsanTcpIp`, model label "vSAN TCP/IP"; identity `host_uuid`, `stack`; objects observed **4**; live model.
@@ -2232,6 +2281,30 @@ Model kind `VsanTcpIp`, model label "vSAN TCP/IP"; identity `host_uuid`, `stack`
 | `cptvsan\|Network\|TCP/IP Stack:{stack}\|tcpHalfopenDropRateActual` | TCP halfopen drop (rate, actual) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  | dropped |
 | `cptvsan\|Network\|TCP/IP Stack:{stack}\|tcpTimeoutDropRateActual` | TCP timeout drop (rate, actual) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  | dropped |
 | `cptvsan\|Network\|TCP/IP Stack:{stack}\|tcpErrsActual` | TCP errors (actual) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  | dropped |
+
+#### `cptvsan|Network|VMkernel NIC:{vmknic}` <- `vnic-rdt-network-latency`
+
+Model kind `VsanVnicRdtLatency`, model label "vSAN VMkernel RDT Latency"; identity `host_uuid`, `vmknic`; objects observed **4**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|avgLatency` | RDT Network VNIC Average Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|minLatency` | RDT Network Cluster Min Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|maxLatency` | RDT Network Cluster Max Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|rxSbSpaceMin` | RDT Network Socket Min Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|rxSbSpaceMax` | RDT Network Socket Max Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|rxSbSpaceAvg` | RDT Network Socket Average Inbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txSbSpaceMin` | RDT Network Socket Min Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txSbSpaceMax` | RDT Network Socket Max Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txSbSpaceAvg` | RDT Network Socket Average Outbound Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txCtxQMin` | RDT Network Min Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txCtxQMax` | RDT Network Max Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txCtxQAvg` | RDT Network Average Outbound Context Bytes | schema | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txQLatMin` | RDT Network Min Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txQLatMax` | RDT Network Max Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|txQLatAvg` | RDT Network Average Outbound Queueing Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|numReadyDelay` | Num ready delay | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Network\|VMkernel NIC:{vmknic}\|kaReset` | Keepalive reset | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
 
 #### `cptvsan|Network|VMkernel NIC:{vmknic}` <- `vsan-vnic-net`
 
@@ -2304,934 +2377,830 @@ Model kind `VsanVnic`, model label "vSAN VMkernel NIC"; identity `host_uuid`, `s
 | `cptvsan\|Network\|VMkernel NIC:{vmknic}\|ioChainRxdropsActual` | IO chain RX drops (actual) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  | dropped |
 | `cptvsan\|Network\|VMkernel NIC:{vmknic}\|ioChainTxdropsActual` | IO chain TX drops (actual) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  | dropped |
 
-#### `cptvsan|Placement|CLOM` <- `clom-host`
-
-Model kind `VsanClomHost`, model label "vSAN CLOM Host"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Placement\|CLOM\|nodeCompCntRatio` | Node Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CLOM\|nodeDataCompCntRatio` | Node Data Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-
-#### `cptvsan|Placement|CLOM Disk:{disk_uuid}` <- `clom-disk`
-
-Model kind `VsanClomDisk`, model label "vSAN CLOM Disk"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Placement\|CLOM Disk:{disk_uuid}\|diskCompCntRatio` | Disk Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CLOM Disk:{disk_uuid}\|diskDataCompCntRatio` | Disk Data Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CLOM Disk:{disk_uuid}\|diskgrpDataCompCntRatio` | Diskgroup data Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-
-#### `cptvsan|Placement|CMMDS Workload` <- `cmmds-workload`
-
-Model kind `VsanCmmdsWorkload`, model label "vSAN CMMDS Workload"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Placement\|CMMDS Workload\|agentBatchesSent` | Agent Batches Sent | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|checkPointBatchesSent` | Check Point Batches Sent | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|masterBatchesRecved` | Primary Batches Received | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|rxAccept` | Inbound Accept | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|rxAgentUpdateRequest` | Inbound Agent Update Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|rxHeartbeatRequest` | Inbound Heartbeat Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|rxMasterUpdate` | Inbound Primary Update | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|rxMisc` | Inbound Misc | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|rxRetransmitRequest` | Inbound Retransmit Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|rxSnapshot` | Inbound Snapshot | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|totalUpdInBatchCkpt` | Total Updated In Batch Check Point | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|totalUpdInMasterBatches` | Total Updated In Primary Batches | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|totalUpdSentInAgentBatch` | Total Updated In Agent Batch | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txAgentUpdateRequest` | Outbound Agent Update Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txHeartbeatRequest` | Outbound Heartbeat Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txMasterCheckpoint` | Outbound Primary Check Point | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txMasterCkptTried` | Outbound Primary Check Point Tried | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txMasterUpdate` | Outbound Primary Update | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txMasterUpdateTried` | Outbound Primary Update Tried | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txRetransmitRequest` | Outbound Retransmit Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txSnapshot` | Outbound Snapshot | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txSnapshotBytes` | Outbound Snapshot Bytes | schema | `DATA_SIZE.BYTE` | name rule (_unit_from_name) | number |  |  |
-| `cptvsan\|Placement\|CMMDS Workload\|txSnapshotTried` | Outbound Snapshot Tried | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-
-#### `cptvsan|Placement|Distribution` <- `vsan-distribution`
-
-Model kind `VsanDistribution`, model label "vSAN Distribution"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Placement\|Distribution\|components` | Components | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|Distribution\|domClients` | DOM Clients | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|Distribution\|domColocated` | DOM Colocated | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|Distribution\|domOwners` | DOM Owners | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Placement\|Distribution\|ioComponents` | IO Components | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-
-#### `cptvsan|Services|File Service` <- `vsan-file-service`
-
-Model kind `VsanFileService`, model label "vSAN File Service"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|File Service\|readLatency` | Read latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Services\|File Service\|readOpTotal` | IOPS for read operations | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|File Service\|readRequested` | Requested bytes for read | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Services\|File Service\|readTransferred` | Actual transferred bytes for read | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Services\|File Service\|writeLatency` | Write latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Services\|File Service\|writeOpTotal` | IOPS for write operations | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|File Service\|writeRequested` | Requested bytes for write | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Services\|File Service\|writeTransferred` | Actual transferred bytes for write | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-
-#### `cptvsan|Services|IOInsight` <- `ioinsight`
-
-Model kind `VsanIoinsight`, model label "vSAN Ioinsight"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|IOInsight\|aligned4kRatio` | 4K Aligned IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|aligned4kReadRatio` | 4K Aligned Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|aligned4kWriteRatio` | 4K Aligned Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|IOInsight\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|IOInsight\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|IOInsight\|randomRatio` | Random IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|randomReadRatio` | Random Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|randomWriteRatio` | Random Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|readRatio` | Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz0_4k` | ReadSize<4K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz128k` | ReadSize=128K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz128k_256k` | 128K<ReadSize<256K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz16k` | ReadSize=16K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz16k_32k` | 16K<ReadSize<32K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz1_m` | ReadSize>1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz1m` | ReadSize=1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz256k` | ReadSize=256K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz256k_512k` | 256K<ReadSize<512K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz32k` | ReadSize=32K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz32k_64k` | 32K<ReadSize<64K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz4k` | ReadSize=4K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz4k_8k` | 4K<ReadSize<8K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz512k` | ReadSize=512K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz512k_1m` | 512K<ReadSize<1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz64k` | ReadSize=64K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz64k_128k` | 64K<ReadSize<128K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz8k` | ReadSize=8K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|riosz8k_16k` | 8K<ReadSize<16K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat0_1us` | 0<ReadLatency<1(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat100_500us` | 100<ReadLatency<500(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat100_ms` | ReadLatency>100(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat10_100us` | 10<ReadLatency<100(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat10_25ms` | 10<ReadLatency<25(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat1_10us` | 1<ReadLatency<10(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat1_5ms` | 1<ReadLatency<5(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat25_50ms` | 25<ReadLatency<50(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat500us_1ms` | 500us<ReadLatency<1ms | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat50_100ms` | 50<ReadLatency<100(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|rlat5_10ms` | 5<ReadLatency<10(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|sequentialRatio` | Sequential IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|sequentialReadRatio` | Sequential Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|sequentialWriteRatio` | Sequential Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|throughputRandom` | Random Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | rate_bytes | V |  |
-| `cptvsan\|Services\|IOInsight\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Services\|IOInsight\|throughputSequential` | Sequential Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | rate_bytes | V |  |
-| `cptvsan\|Services\|IOInsight\|throughputTotal` | Total Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | rate_bytes | V |  |
-| `cptvsan\|Services\|IOInsight\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Services\|IOInsight\|unaligned4kRatio` | 4K Unaligned IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|unaligned4kReadRatio` | 4K Unaligned Read IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|unaligned4kWriteRatio` | 4K Unaligned Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz0_4k` | WriteSize<4K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz128k` | WriteSize=128K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz128k_256k` | 128K<WriteSize<256K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz16k` | WriteSize=16K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz16k_32k` | 16K<WriteSize<32K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz1_m` | WriteSize>1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz1m` | WriteSize=1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz256k` | WriteSize=256K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz256k_512k` | 256K<WriteSize<512K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz32k` | WriteSize=32K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz32k_64k` | 32K<WriteSize<64K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz4k` | WriteSize=4K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz4k_8k` | 4K<WriteSize<8K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz512k` | WriteSize=512K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz512k_1m` | 512K<WriteSize<1M | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz64k` | WriteSize=64K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz64k_128k` | 64K<WriteSize<128K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz8k` | WriteSize=8K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wiosz8k_16k` | 8K<WriteSize<16K | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat0_1us` | 0<WriteLatency<1(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat100_500us` | 100<WriteLatency<500(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat100_ms` | WriteLatency>100(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat10_100us` | 10<WriteLatency<100(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat10_25ms` | 10<WriteLatency<25(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat1_10us` | 1<WriteLatency<10(us) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat1_5ms` | 1<WriteLatency<5(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat25_50ms` | 25<WriteLatency<50(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat500us_1ms` | 500us<WriteLatency<1ms | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat50_100ms` | 50<WriteLatency<100(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|wlat5_10ms` | 5<WriteLatency<10(ms) | schema | unit unknown | none (no HCIBench entry, no name rule) | permille | V |  |
-| `cptvsan\|Services\|IOInsight\|writeRatio` | Write IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | permille | V |  |
-
-#### `cptvsan|Services|PMEM` <- `host-pmem`
+#### `cptvsan|PMEM` <- `host-pmem`
 
 Model kind `VsanHostPmem`, model label "vSAN Host PMem"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|PMEM\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
-| `cptvsan\|Services\|PMEM\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
-| `cptvsan\|Services\|PMEM\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
-| `cptvsan\|Services\|PMEM\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|PMEM\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|PMEM\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|PMEM\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ns |  |  |
-| `cptvsan\|Services\|PMEM\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ns |  |  |
+| `cptvsan\|PMEM\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
+| `cptvsan\|PMEM\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
+| `cptvsan\|PMEM\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | number |  |  |
+| `cptvsan\|PMEM\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|PMEM\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|PMEM\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|PMEM\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ns |  |  |
+| `cptvsan\|PMEM\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ns |  |  |
 
-#### `cptvsan|Services|iSCSI|Host` <- `vsan-iscsi-host`
+#### `cptvsan|Placement` <- `clom-host`
 
-Model kind `VsanIscsiHost`, model label "vSAN iSCSI Host"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|iSCSI\|Host\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|latencyTotal` | Total Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|Host\|queueDepth` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-
-#### `cptvsan|Services|iSCSI|LUN:{target}-{lun}` <- `vsan-iscsi-lun`
-
-Model kind `VsanIscsiLun`, model label "vSAN iSCSI LUN"; identity `host_uuid`, `target`, `lun`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+Model kind `VsanClomHost`, model label "vSAN CLOM Host"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|latencyTotal` | Total Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}\|queueDepth` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|nodeCompCntRatio` | Node Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|nodeDataCompCntRatio` | Node Data Component Count Ratio | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
 
-#### `cptvsan|Services|iSCSI|Target:{target}` <- `vsan-iscsi-target`
+#### `cptvsan|Placement` <- `cmmds-workload`
 
-Model kind `VsanIscsiTarget`, model label "vSAN iSCSI Target"; identity `host_uuid`, `target`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+Model kind `VsanCmmdsWorkload`, model label "vSAN CMMDS Workload"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|latencyTotal` | Total Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Services\|iSCSI\|Target:{target}\|queueDepth` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|agentBatchesSent` | Agent Batches Sent | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|checkPointBatchesSent` | Check Point Batches Sent | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|masterBatchesRecved` | Primary Batches Received | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|rxAccept` | Inbound Accept | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|rxAgentUpdateRequest` | Inbound Agent Update Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|rxHeartbeatRequest` | Inbound Heartbeat Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|rxMasterUpdate` | Inbound Primary Update | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|rxMisc` | Inbound Misc | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|rxRetransmitRequest` | Inbound Retransmit Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|rxSnapshot` | Inbound Snapshot | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|totalUpdInBatchCkpt` | Total Updated In Batch Check Point | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|totalUpdInMasterBatches` | Total Updated In Primary Batches | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|totalUpdSentInAgentBatch` | Total Updated In Agent Batch | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txAgentUpdateRequest` | Outbound Agent Update Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txHeartbeatRequest` | Outbound Heartbeat Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txMasterCheckpoint` | Outbound Primary Check Point | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txMasterCkptTried` | Outbound Primary Check Point Tried | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txMasterUpdate` | Outbound Primary Update | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txMasterUpdateTried` | Outbound Primary Update Tried | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txRetransmitRequest` | Outbound Retransmit Request | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txSnapshot` | Outbound Snapshot | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|txSnapshotBytes` | Outbound Snapshot Bytes | schema | `DATA_SIZE.BYTE` | name rule (_unit_from_name) | number |  |  |
+| `cptvsan\|Placement\|txSnapshotTried` | Outbound Snapshot Tried | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
 
-#### `cptvsan|Services|vSAN Direct` <- `vsan-direct-host`
+#### `cptvsan|Placement` <- `vsan-distribution`
 
-Model kind `VsanDirectHost`, model label "vSAN Direct Host"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|vSAN Direct\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|vSAN Direct\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|vSAN Direct\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Services\|vSAN Direct\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Services\|vSAN Direct\|oioDevRead` | Read Outstanding IO | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|Services\|vSAN Direct\|oioDevWrite` | Write Outstanding IO | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|Services\|vSAN Direct\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Services\|vSAN Direct\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-
-#### `cptvsan|Services|vSAN Direct Cluster` <- `vsan-direct-cluster`
-
-Model kind `VsanDirectCluster`, model label "vSAN Direct Cluster"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+Model kind `VsanDistribution`, model label "vSAN Distribution"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics).
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Services\|vSAN Direct Cluster\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|vSAN Direct Cluster\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Services\|vSAN Direct Cluster\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Services\|vSAN Direct Cluster\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Services\|vSAN Direct Cluster\|oioDevRead` | Read Outstanding IO | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|Services\|vSAN Direct Cluster\|oioDevWrite` | Write Outstanding IO | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
-| `cptvsan\|Services\|vSAN Direct Cluster\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Services\|vSAN Direct Cluster\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Placement\|components` | Components | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|domClients` | DOM Clients | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|domColocated` | DOM Colocated | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|domOwners` | DOM Owners | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Placement\|ioComponents` | IO Components | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
 
-#### `cptvsan|Storage I/O|DOM Client` <- `host-domclient`
-
-Model kind `VsanHostDomclient`, model label "Host Domclient"; identity `host_uuid`; objects observed **4**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|DOM Client\|iops` | IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|throughput` | Throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyAvg` | Latency (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyStddev` | Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|ioCount` | IO count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Client\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|clientCacheHits` | Local Client Cache Hit IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|clientCacheHitRate` | Local Client Cache Hit Rate | schema | unit unknown | none (HCIBench `short` is dimensionless) | percentage |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyMaxRead` | Latency (max, read) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyMaxWrite` | Latency (max, write) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|unmapCount` | Unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyMaxUnmap` | Latency max unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyStddevRead` | Latency standard deviation (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyStddevWrite` | Latency standard deviation (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyStddevUnmap` | Unmap Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|iopsSegCleanerUnmap` | IOPS seg cleaner unmap | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|segCleanerUnmapLeafOwnerLatency` | Seg cleaner unmap leaf owner latency | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|segCleanerUnmapLeafOwnerMaxLatencyAvgUs` | Seg cleaner unmap leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|throughputSegCleanerUnmap` | Throughput seg cleaner unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyAvgSegCleanerUnmap` | Latency avg seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyStddevSegCleanerUnmap` | Latency standard deviation seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|latencyMaxSegCleanerUnmap` | Latency max seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|segCleanerUnmapCongestion` | Seg cleaner unmap congestion | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsNoMem` | Client ops no mem (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsRetry` | Client ops retry (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsNoSpace` | Client ops no space (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsNoConnect` | Client ops no connect (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsIoError` | Client ops IO error (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsChecksumMismatch` | Client ops checksum mismatch (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsLimitExceed` | Client ops limit exceed (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsBadParam` | Client ops bad param (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateClientOpsNotSupported` | Client ops not supported (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|rateOtherClientOpsFailure` | Other client ops failure (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|oioResyncRead` | Outstanding IO resync (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|oioRecoveryWrite` | Outstanding IO recovery (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|burstsPerSecond` | Bursts per second | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstTotalTime` | Burst total time (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstArrivalTime` | Burst arrival time (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstCompletionTime` | Burst completion time (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstPeakOIO` | Burst peak outstanding IO (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstPeakOutstandingKb` | Burst peak outstanding kb (average) | derived | unit unknown | none (HCIBench `KBps` not mapped; no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgPctTimeToPeak` | Percent time to peak (average) | derived | unit unknown | deliberately none (AMBIGUOUS_UNIT; HCIBench says `µs`) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|IOPSWithinBursts` | IOPS within bursts | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|bandwidthWithinBursts` | Bandwidth within bursts | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|numBurstStatsSkipped` | Num burst stats skipped | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|burstsPerSecondMultiObj` | Bursts per second multi obj | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstTotalTimeMultiObj` | Burst total time multi obj (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstArrivalTimeMultiObj` | Burst arrival time multi obj (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstCompletionTimeMultiObj` | Burst completion time multi obj (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstPeakOIOMultiObj` | Burst peak outstanding IO multi obj (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgBurstPeakOutstandingKbMultiObj` | Burst peak outstanding kb multi obj (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|avgPctTimeToPeakMultiObj` | Percent time to peak multi obj (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|IOPSWithinBurstsMultiObj` | IOPS within bursts multi obj | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|bandwidthWithinBurstsMultiObj` | Bandwidth within bursts multi obj | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|IOPSWithinBurstsExclFirstObj` | IOPS within bursts excl first obj | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|bandwidthWithinBurstsExclFirstObj` | Bandwidth within bursts excl first obj | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|lessSkewedMultiBurstsPerSecond` | Less skewed multi bursts per second | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|serverSwitchCount` | Server switch count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|serverSwitchLatencyMaxUs` | Server switch latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Client\|serverSwitchAvglatency` | Server switch average latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-
-#### `cptvsan|Storage I/O|DOM Component Manager` <- `host-domcompmgr`
-
-Model kind `VsanHostDomcompmgr`, model label "Host Domcompmgr"; identity `host_uuid`; objects observed **4**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iops` | IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughput` | Throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvg` | Latency (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyStddev` | Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|ioCount` | IO count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsRecWrite` | Recovery Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughputRecWrite` | Recovery Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgRecWrite` | Recovery Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|recWriteCount` | Recovery write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latAvgResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|resyncReadCount` | Resync read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|recWriteCongestion` | Recovery write congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|resyncReadCongestion` | Resync read congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyMaxRead` | Latency (max, read) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyMaxWrite` | Latency (max, write) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|regulatorIopsRead` | Regulator IOPS (read) | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|regulatorIopsWrite` | Regulator IOPS (write) | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|sharedCongestion` | Shared congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|componentCongestion` | Component congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|metadataQueueDepthRead` | Metadata queue depth (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|metadataQueueDepthWrite` | Metadata queue depth (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|namespaceQueueDepthRead` | Namespace queue depth (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|namespaceQueueDepthWrite` | Namespace queue depth (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|resyncQueueDepthRead` | Resync queue depth (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|resyncQueueDepthWrite` | Resync queue depth (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|vmdiskQueueDepthRead` | VM disk queue depth (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|vmdiskQueueDepthWrite` | VM disk queue depth (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|metadataDispatchedCostRead` | Metadata dispatched cost (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|metadataDispatchedCostWrite` | Metadata dispatched cost (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|namespaceDispatchedCostRead` | Namespace dispatched cost (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|namespaceDispatchedCostWrite` | Namespace dispatched cost (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|resyncDispatchedCostRead` | Resync dispatched cost (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|resyncDispatchedCostWrite` | Resync dispatched cost (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|vmdiskDispatchedCostRead` | VM disk dispatched cost (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|vmdiskDispatchedCostWrite` | VM disk dispatched cost (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|unmapCount` | Unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|iopsRecUnmap` | Recovery Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|throughputRecUnmap` | Recovery Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgRecUnmap` | Recovery Unmap Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|recUnmapCount` | Recovery unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|recUnmapCongestion` | Recovery unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyMaxUnmap` | Latency max unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyStddevRead` | Latency standard deviation (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyStddevWrite` | Latency standard deviation (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyStddevUnmap` | Unmap Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsNoMem` | Compmgr ops no mem (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsRetry` | Compmgr ops retry (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsNoSpace` | Compmgr ops no space (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsNoConnect` | Compmgr ops no connect (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsIoError` | Compmgr ops IO error (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsChecksumMismatch` | Compmgr ops checksum mismatch (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsLimitExceed` | Compmgr ops limit exceed (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsBadParam` | Compmgr ops bad param (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateCompmgrOpsNotSupported` | Compmgr ops not supported (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|rateOtherCompmgrOpsFailure` | Other compmgr ops failure (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|tputServiceVMRead` | Throughput service VM (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgServiceVMRead` | Latency avg service VM (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|tputServiceVMWrite` | Throughput service VM (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|latencyAvgServiceVMWrite` | Latency avg service VM (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|oioResyncRead` | Outstanding IO resync (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Component Manager\|oioRecoveryWrite` | Outstanding IO recovery (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-
-#### `cptvsan|Storage I/O|DOM Owner` <- `host-domowner`
-
-Model kind `VsanHostDomowner`, model label "Host Domowner"; identity `host_uuid`; objects observed **4**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|DOM Owner\|iops` | IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|throughput` | Throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvg` | Latency (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyStddev` | Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ioCount` | IO count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|recoveryWriteCongestion` | Resync Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputRead` | Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|resyncReadCount` | Resync read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputWrite` | Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsRecWrite` | Recovery Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputRecWrite` | Recovery Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgRecWrite` | Recovery Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|recWriteCount` | Recovery write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyMaxRead` | Latency (max, read) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyMaxWrite` | Latency (max, write) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputUnmap` | Throughput unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|unmapCount` | Unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsRecUnmap` | Recovery Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputRecUnmap` | Throughput recovery unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgRecUnmap` | Recovery Unmap Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|recUnmapCount` | Recovery unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|recoveryUnmapCongestion` | Recovery unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyMaxUnmap` | Latency max unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readLeafOwnerLatency` | Read leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeLeafOwnerLatency` | Write leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|unmapLeafOwnerLatency` | Unmap leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|recoveryWriteLeafOwnerLatency` | Recovery write leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|recoveryUnmapLeafOwnerLatency` | Recovery unmap leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteResyncOps` | Num complete resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteRwrOps` | Num complete rwr ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteResyncRwrBatches` | Num complete resync rwr batches | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|avgResyncParallelism` | Resync parallelism (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyStddevRead` | Latency standard deviation (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyStddevWrite` | Latency standard deviation (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyStddevUnmap` | Unmap Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingResyncJobs` | Num pending resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingDecomResyncJobs` | Num pending decom resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedResyncJobs` | Num suspended resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedResyncChangemaps` | Num suspended resync changemaps | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedSharedResyncJobs` | Num suspended shared resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedPriorityResyncJobs` | Num suspended priority resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numRunningResyncJobs` | Num running resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numInflightSharedResyncJobs` | Num inflight shared resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numInflightPriorityResyncJobs` | Num inflight priority resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOCount` | High outstanding IO count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOCountPercent` | High outstanding IO count percent | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOThroughput` | High outstanding IO throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOBytes` | High outstanding IO bytes | derived | `DATA_SIZE.BYTE` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIODurationMs` | High outstanding IO duration ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIODurationPercent` | High outstanding IO duration percent | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIONumTimes` | High outstanding IO num times | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgOIO` | High outstanding IO avg outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgDurationMs` | High outstanding IO avg duration ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgIOCount` | High outstanding IO avg IO count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOCountRead` | High outstanding IO count (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOCountPercentRead` | High outstanding IO count percent (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOThroughputRead` | High outstanding IO throughput (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOBytesRead` | High outstanding IO bytes (read) | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIODurationMsRead` | High outstanding IO duration ms (read) | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIODurationPercentRead` | High outstanding IO duration percent (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIONumTimesRead` | High outstanding IO num times (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgOIORead` | High outstanding IO avg outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgDurationMsRead` | High outstanding IO avg duration ms (read) | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgIOCountRead` | High outstanding IO avg IO count (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOCountWrite` | High outstanding IO count (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOCountPercentWrite` | High outstanding IO count percent (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOThroughputWrite` | High outstanding IO throughput (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOBytesWrite` | High outstanding IO bytes (write) | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIODurationMsWrite` | High outstanding IO duration ms (write) | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIODurationPercentWrite` | High outstanding IO duration percent (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIONumTimesWrite` | High outstanding IO num times (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgOIOWrite` | High outstanding IO avg outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgDurationMsWrite` | High outstanding IO avg duration ms (write) | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|highOIOAvgIOCountWrite` | High outstanding IO avg IO count (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readECLeafOwnerMaxLatencyAvgUs` | Read ec leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeECLeafOwnerMaxLatencyAvgUs` | Write ec leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|unmapECLeafOwnerMaxLatencyAvgUs` | Unmap ec leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingFullResyncJobs` | Num pending full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingDeltaToBaseResyncJobs` | Num pending delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingSiblingToDeltaResyncJobs` | Num pending sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numRunningFullResyncJobs` | Num running full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numRunningDeltaToBaseResyncJobs` | Num running delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numRunningSiblingToDeltaResyncJobs` | Num running sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedFullResyncJobs` | Num suspended full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedDeltaToBaseResyncJobs` | Num suspended delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedSiblingToDeltaResyncJobs` | Num suspended sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|deltaSourceChanges` | Delta source changes | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|resyncsStartedAsDeltaToBase` | Resyncs started as delta to base | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|resyncsEndedAsDeltaToBase` | Resyncs ended as delta to base | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|deltaLeafGTEs` | Delta leaf gt es | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|leafGTEs` | Leaf gt es | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|totalDeltaCreationDomActiveLatency` | Delta creation DOM active latency (total) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|totalDeltaCreationDomCreationLatency` | Delta creation DOM creation latency (total) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|totalDeltasCreatedCount` | Deltas created count (total) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteDeltaToBaseResyncOps` | Num complete delta to base resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteSiblingToDeltaResyncOps` | Num complete sibling to delta resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numCompleteFullResyncOps` | Num complete full resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ownerECCacheNumCachedObjects` | Owner ec cache num cached objects | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ownerECCacheHitMissRatio` | Owner ec cache hit miss ratio | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ownerECCacheNumFailedAllocs` | Owner ec cache num failed allocs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ownerECCacheNumSuccessAllocs` | Owner ec cache num success allocs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|avgDeltaCreationDomActiveLatency` | Delta creation DOM active latency (average) | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|avgDeltaCreationDomCreationLatency` | Delta creation DOM creation latency (average) | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readECLeafOwnerMaxLatencyUs` | Read ec leaf owner max latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeECLeafOwnerMaxLatencyUs` | Write ec leaf owner max latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|unmapECLeafOwnerMaxLatencyUs` | Unmap ec leaf owner max latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readLeafOwnerMaxLatencyAvgUs` | Read leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeLeafOwnerMaxLatencyAvgUs` | Write leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|unmapLeafOwnerMaxLatencyAvgUs` | Unmap leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ecWriteCount` | Ec write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ecStridedWriteCount` | Ec strided write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ecStridedWriteHits` | Ec strided write hits | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ecCachedWriteCount` | Ec cached write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ecCachedWriteHits` | Ec cached write hits | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|ecFswCount` | Ec fsw count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCPrepareRetryCount` | Two pc prepare retry count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCCommitCount` | Two pc commit count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCCommitSize` | Two pc commit size | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|owner2PCCommitLatencyAvgUs` | Owner2 pc commit latency avg us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCReservedLSNUsedCount` | Two pc reserved lsn used count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCReservedLSNUnusedCount` | Two pc reserved lsn unused count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCReservedLSNExhaustedCount` | Two pc reserved lsn exhausted count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|iopsSegCleanerUnmap` | IOPS seg cleaner unmap | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|segCleanerUnmapLeafOwnerLatency` | Seg cleaner unmap leaf owner latency | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|segCleanerUnmapLeafOwnerMaxLatencyAvgUs` | Seg cleaner unmap leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|throughputSegCleanerUnmap` | Throughput seg cleaner unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgSegCleanerUnmap` | Latency avg seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyStddevSegCleanerUnmap` | Latency standard deviation seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyMaxSegCleanerUnmap` | Latency max seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|segCleanerUnmapCongestion` | Seg cleaner unmap congestion | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|resyncReadLeafOwnerLatency` | Resync read leaf owner latency | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerIops` | Num net sched owner IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompIops` | Num net sched comp IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerRecoveryWriteIops` | Num net sched owner recovery write IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompRecoveryWriteIops` | Num net sched comp recovery write IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerResyncReadIops` | Num net sched owner resync read IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompResyncReadIops` | Num net sched comp resync read IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerIopsLimit` | Num net sched owner IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompIopsLimit` | Num net sched comp IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerRecoveryWriteIopsLimit` | Num net sched owner recovery write IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompRecoveryWriteIopsLimit` | Num net sched comp recovery write IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerResyncReadIopsLimit` | Num net sched owner resync read IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompResyncReadIopsLimit` | Num net sched comp resync read IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerTpThrottled` | Num net sched owner tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompTpThrottled` | Num net sched comp tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedRecoveryWriteTpThrottled` | Num net sched recovery write tp throttled | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedResyncReadTpThrottled` | Num net sched resync read tp throttled | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerRecoveryWriteTpThrottled` | Num net sched owner recovery write tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompRecoveryWriteTpThrottled` | Num net sched comp recovery write tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedOwnerResyncReadTpThrottled` | Num net sched owner resync read tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedCompResyncReadTpThrottled` | Num net sched comp resync read tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedHighBand` | Num net sched high band | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedMidBand` | Num net sched mid band | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedLowBand` | Num net sched low band | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedHighBandLowLimit` | Num net sched high band low limit | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedLowBandHighLimit` | Num net sched low band high limit | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedMidBandHighLimit` | Num net sched mid band high limit | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedHighBandHighShare` | Num net sched high band high share | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedMidBandLowShare` | Num net sched mid band low share | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedLowToHighBand` | Num net sched low to high band | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedLowToMidBand` | Num net sched low to mid band | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedMidToLowBand` | Num net sched mid to low band | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedMidToHighBand` | Num net sched mid to high band | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedHighToLowBand` | Num net sched high to low band | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedHighToMidBand` | Num net sched high to mid band | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedControllerActivations` | Num net sched controller activations | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedControllerIopsLimit` | Num net sched controller IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedResyncTotalSharePercent` | Num net sched resync total share percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedSeenTotalTpBps` | Num net sched seen total tp bps | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedSeenResyncTpBps` | Num net sched seen resync tp bps | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedSeenNonResyncTpBps` | Num net sched seen non resync tp bps | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedHighBandSec` | Num net sched high band sec | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedMidBandSec` | Num net sched mid band sec | derived | `TIME.SECONDS` | HCIBench `s` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedLowBandSec` | Num net sched low band sec | derived | `TIME.SECONDS` | HCIBench `s` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedRollingAvgLatUs` | Num net sched rolling avg latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numBlockedResyncJobs` | Num blocked resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numBlockedSharedResyncJobs` | Num blocked shared resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numBlockedPriorityResyncJobs` | Num blocked priority resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numBlockedFullResyncJobs` | Num blocked full resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numBlockedDeltaToBaseResyncJobs` | Num blocked delta to base resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numBlockedSiblingToDeltaResyncJobs` | Num blocked sibling to delta resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|oioResyncRead` | Outstanding IO resync (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|oioRecoveryWrite` | Outstanding IO recovery (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readLeafOwnerIops` | Read leaf owner IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeLeafOwnerIops` | Write leaf owner IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readLeafOwnerThroughput` | Read leaf owner throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeLeafOwnerThroughput` | Write leaf owner throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readLeafOwnerRetriesPerOp` | Read leaf owner retries per op | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeLeafOwnerRetriesPerOp` | Write leaf owner retries per op | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readOwnerRetriesPerOp` | Read owner retries per op | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeOwnerRetriesPerOp` | Write owner retries per op | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readLeafOwnerLatencyRemote` | Read leaf owner latency remote | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeLeafOwnerLatencyRemote` | Write leaf owner latency remote | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|resyncReadLeafOwnerLatencyRemote` | Resync read leaf owner latency remote | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|recoveryWriteLeafOwnerLatencyRemote` | Recovery write leaf owner latency remote | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|readLeafOwnerLatencyLocal` | Read leaf owner latency local | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|writeLeafOwnerLatencyLocal` | Write leaf owner latency local | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|resyncReadLeafOwnerLatencyLocal` | Resync read leaf owner latency local | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|recoveryWriteLeafOwnerLatencyLocal` | Recovery write leaf owner latency local | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|serverSwitchCount` | Server switch count | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|serverSwitchLatencyMaxUs` | Server switch latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|serverSwitchAvglatency` | Server switch average latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|serverSwitchlatencyStddev` | Server switchlatency standard deviation | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsNoMem` | Owner ops no mem (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsRetry` | Owner ops retry (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsNoSpace` | Owner ops no space (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsNoConnect` | Owner ops no connect (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsIoError` | Owner ops IO error (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsChecksumMismatch` | Owner ops checksum mismatch (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsLimitExceed` | Owner ops limit exceed (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsBadParam` | Owner ops bad param (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOwnerOpsNotSupported` | Owner ops not supported (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|rateOtherOwnerOpsFailure` | Other owner ops failure (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputServiceVMRead` | Throughput service VM (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgServiceVMRead` | Latency avg service VM (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|tputServiceVMWrite` | Throughput service VM (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyAvgServiceVMWrite` | Latency avg service VM (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedUnderUtilCount` | Net sched under utilization count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedUnderUtilGuestBps` | Net sched under utilization guest bps | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedUnderUtilTtlBps` | Net sched under utilization ttl bps | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBandwidthDiscoveryBps` | Net sched bandwidth discovery bps | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWDiscoverySessions` | Net sched bw discovery sessions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocationSessions` | Net sched bw reallocation sessions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWDiscoveryActions` | Net sched bw discovery actions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocationActions` | Net sched bw reallocation actions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedResyncGainsFromGuestCount` | Net sched resync gains from guest count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWDiscoveryUtilizationPct` | Net sched bw discovery utilization percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedLatencyIncreaseFromResyncPerDiscoverySessionPct` | Net sched latency increase from resync per discovery session percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedGuestIopsIncreasePerReallocationSession` | Net sched guest IOPS increase per reallocation session | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedGuestIopsDecreasePerDiscoverySession` | Net sched guest IOPS decrease per discovery session | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedResyncIopsIncreasePerDiscoverySession` | Net sched resync IOPS increase per discovery session | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedResyncIopsDecreasePerReallocationSession` | Net sched resync IOPS decrease per reallocation session | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWDiscoveredPerDiscoverySession` | Net sched bw discovered per discovery session | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocatedPerReallocationSession` | Net sched bw reallocated per reallocation session | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWDiscoveryStopsDueToHighLatencyPct` | Net sched bw discovery stops due to high latency percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWDiscoveryStopsDueToGainsFromGuestPct` | Net sched bw discovery stops due to gains from guest percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocationStopsDueToLowUtilizationPct` | Net sched bw reallocation stops due to low utilization percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocationStopsDueToHighSharePct` | Net sched bw reallocation stops due to high share percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWDiscoveryAvgIntervalsUs` | Net sched bw discovery avg intervals us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocationAvgIntervalsUs` | Net sched bw reallocation avg intervals us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedAvgOwnerRecoveryWriteDelayMs` | Net sched avg owner recovery write delay ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedAvgCompRecoveryWriteDelayMs` | Net sched avg comp recovery write delay ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedAvgOwnerResyncReadDelayMs` | Net sched avg owner resync read delay ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedAvgCompResyncReadDelayMs` | Net sched avg comp resync read delay ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCPrepareLimitRetryResyncIOPS` | Two pc prepare limit retry resync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCPrepareLimitRetryGuestIOPS` | Two pc prepare limit retry guest IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCPrepareLimitRetryOtherIOPS` | Two pc prepare limit retry other IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCPrepareLimitRetryResyncAvgTimeMs` | Two pc prepare limit retry resync avg time ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCPrepareLimitRetryGuestAvgTimeMs` | Two pc prepare limit retry guest avg time ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCPrepareLimitRetryOtherAvgTimeMs` | Two pc prepare limit retry other avg time ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCBatchCommitSyncIOPS` | Two pc batch commit sync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCBatchCommitResyncIOPS` | Two pc batch commit resync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCBatchCommitGuestIOPS` | Two pc batch commit guest IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCBatchCommitOtherIOPS` | Two pc batch commit other IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCBatchCommitBlockedBySyncIOPS` | Two pc batch commit blocked by sync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCBatchCommitBlockedByResyncIOPS` | Two pc batch commit blocked by resync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCBatchCommitBlockedByGuestIOPS` | Two pc batch commit blocked by guest IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|twoPCBatchCommitBlockedByOtherIOPS` | Two pc batch commit blocked by other IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWDiscoveryStopsDueToLowUtilizationPct` | Net sched bw discovery stops due to low utilization percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocationUtilizationRatio` | Net sched bw reallocation utilization ratio | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocationUtilizationRatioBelow` | Net sched bw reallocation utilization ratio below | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedBWReallocationUtilizationRatioAbove` | Net sched bw reallocation utilization ratio above | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedGuestLTLatUs` | Num net sched guest lt latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numNetSchedLowBandThreshUs` | Num net sched low band thresh us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numSuspendedDedupResyncJobs` | Num suspended dedup resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numInflightDedupResyncJobs` | Num inflight dedup resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|numPendingDedupResyncJobs` | Num pending dedup resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyStddevResyncRead` | Latency standard deviation resync (read) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|latencyStddevRecoveryWrite` | Latency standard deviation recovery (write) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|DOM Owner\|netSchedLowBandPct` | no label in source | - | percent (by construction; not declared) | app/push.py formula | - |  | derived |
-
-#### `cptvsan|Storage I/O|Remote DOM Client` <- `host-remotedomclient`
-
-Model kind `VsanHostRemotedomclient`, model label "vSAN Host Remotedomclient"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|Remote DOM Client\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-
-#### `cptvsan|Storage I/O|Remote DOM Client (Compute)` <- `computeHost-remotedomclient`
+#### `cptvsan|Storage I/O:remote-dom-client-compute` <- `computeHost-remotedomclient`
 
 Model kind `VsanComputeHostRemotedomclient`, model label "vSAN ComputeHost Remotedomclient"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|Remote DOM Client (Compute)\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client-compute\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
 
-#### `cptvsan|Storage I/O|vsanSparse` <- `host-vsansparse`
+#### `cptvsan|Storage I/O:dom-client` <- `host-domclient`
+
+Model kind `VsanHostDomclient`, model label "Host Domclient"; identity `host_uuid`; objects observed **4**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Storage I/O:dom-client\|iops` | IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|throughput` | Throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyAvg` | Latency (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyStddev` | Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|ioCount` | IO count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-client\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-client\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-client\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-client\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-client\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-client\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|clientCacheHits` | Local Client Cache Hit IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-client\|clientCacheHitRate` | Local Client Cache Hit Rate | schema | unit unknown | none (HCIBench `short` is dimensionless) | percentage |  |  |
+| `cptvsan\|Storage I/O:dom-client\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyMaxRead` | Latency (max, read) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyMaxWrite` | Latency (max, write) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-client\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-client\|unmapCount` | Unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyMaxUnmap` | Latency max unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyStddevRead` | Latency standard deviation (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyStddevWrite` | Latency standard deviation (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyStddevUnmap` | Unmap Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|iopsSegCleanerUnmap` | IOPS seg cleaner unmap | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|segCleanerUnmapLeafOwnerLatency` | Seg cleaner unmap leaf owner latency | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|segCleanerUnmapLeafOwnerMaxLatencyAvgUs` | Seg cleaner unmap leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|throughputSegCleanerUnmap` | Throughput seg cleaner unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyAvgSegCleanerUnmap` | Latency avg seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyStddevSegCleanerUnmap` | Latency standard deviation seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|latencyMaxSegCleanerUnmap` | Latency max seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|segCleanerUnmapCongestion` | Seg cleaner unmap congestion | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsNoMem` | Client ops no mem (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsRetry` | Client ops retry (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsNoSpace` | Client ops no space (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsNoConnect` | Client ops no connect (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsIoError` | Client ops IO error (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsChecksumMismatch` | Client ops checksum mismatch (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsLimitExceed` | Client ops limit exceed (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsBadParam` | Client ops bad param (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateClientOpsNotSupported` | Client ops not supported (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|rateOtherClientOpsFailure` | Other client ops failure (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|oioResyncRead` | Outstanding IO resync (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|oioRecoveryWrite` | Outstanding IO recovery (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|burstsPerSecond` | Bursts per second | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstTotalTime` | Burst total time (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstArrivalTime` | Burst arrival time (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstCompletionTime` | Burst completion time (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstPeakOIO` | Burst peak outstanding IO (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstPeakOutstandingKb` | Burst peak outstanding kb (average) | derived | unit unknown | none (HCIBench `KBps` not mapped; no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgPctTimeToPeak` | Percent time to peak (average) | derived | unit unknown | deliberately none (AMBIGUOUS_UNIT; HCIBench says `µs`) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|IOPSWithinBursts` | IOPS within bursts | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|bandwidthWithinBursts` | Bandwidth within bursts | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|numBurstStatsSkipped` | Num burst stats skipped | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|burstsPerSecondMultiObj` | Bursts per second multi obj | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstTotalTimeMultiObj` | Burst total time multi obj (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstArrivalTimeMultiObj` | Burst arrival time multi obj (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstCompletionTimeMultiObj` | Burst completion time multi obj (average) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstPeakOIOMultiObj` | Burst peak outstanding IO multi obj (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgBurstPeakOutstandingKbMultiObj` | Burst peak outstanding kb multi obj (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|avgPctTimeToPeakMultiObj` | Percent time to peak multi obj (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|IOPSWithinBurstsMultiObj` | IOPS within bursts multi obj | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|bandwidthWithinBurstsMultiObj` | Bandwidth within bursts multi obj | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|IOPSWithinBurstsExclFirstObj` | IOPS within bursts excl first obj | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|bandwidthWithinBurstsExclFirstObj` | Bandwidth within bursts excl first obj | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|lessSkewedMultiBurstsPerSecond` | Less skewed multi bursts per second | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|serverSwitchCount` | Server switch count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|serverSwitchLatencyMaxUs` | Server switch latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-client\|serverSwitchAvglatency` | Server switch average latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+
+#### `cptvsan|Storage I/O:dom-compmgr` <- `host-domcompmgr`
+
+Model kind `VsanHostDomcompmgr`, model label "Host Domcompmgr"; identity `host_uuid`; objects observed **4**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Storage I/O:dom-compmgr\|iops` | IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughput` | Throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvg` | Latency (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyStddev` | Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|ioCount` | IO count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsRecWrite` | Recovery Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughputRecWrite` | Recovery Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgRecWrite` | Recovery Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|recWriteCount` | Recovery write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latAvgResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|resyncReadCount` | Resync read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|recWriteCongestion` | Recovery write congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|resyncReadCongestion` | Resync read congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyMaxRead` | Latency (max, read) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyMaxWrite` | Latency (max, write) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|regulatorIopsRead` | Regulator IOPS (read) | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|regulatorIopsWrite` | Regulator IOPS (write) | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|sharedCongestion` | Shared congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|componentCongestion` | Component congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|metadataQueueDepthRead` | Metadata queue depth (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|metadataQueueDepthWrite` | Metadata queue depth (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|namespaceQueueDepthRead` | Namespace queue depth (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|namespaceQueueDepthWrite` | Namespace queue depth (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|resyncQueueDepthRead` | Resync queue depth (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|resyncQueueDepthWrite` | Resync queue depth (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|vmdiskQueueDepthRead` | VM disk queue depth (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|vmdiskQueueDepthWrite` | VM disk queue depth (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|metadataDispatchedCostRead` | Metadata dispatched cost (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|metadataDispatchedCostWrite` | Metadata dispatched cost (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|namespaceDispatchedCostRead` | Namespace dispatched cost (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|namespaceDispatchedCostWrite` | Namespace dispatched cost (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|resyncDispatchedCostRead` | Resync dispatched cost (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|resyncDispatchedCostWrite` | Resync dispatched cost (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|vmdiskDispatchedCostRead` | VM disk dispatched cost (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|vmdiskDispatchedCostWrite` | VM disk dispatched cost (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|unmapCount` | Unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|iopsRecUnmap` | Recovery Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|throughputRecUnmap` | Recovery Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgRecUnmap` | Recovery Unmap Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|recUnmapCount` | Recovery unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|recUnmapCongestion` | Recovery unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyMaxUnmap` | Latency max unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyStddevRead` | Latency standard deviation (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyStddevWrite` | Latency standard deviation (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyStddevUnmap` | Unmap Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsNoMem` | Compmgr ops no mem (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsRetry` | Compmgr ops retry (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsNoSpace` | Compmgr ops no space (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsNoConnect` | Compmgr ops no connect (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsIoError` | Compmgr ops IO error (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsChecksumMismatch` | Compmgr ops checksum mismatch (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsLimitExceed` | Compmgr ops limit exceed (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsBadParam` | Compmgr ops bad param (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateCompmgrOpsNotSupported` | Compmgr ops not supported (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|rateOtherCompmgrOpsFailure` | Other compmgr ops failure (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|tputServiceVMRead` | Throughput service VM (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgServiceVMRead` | Latency avg service VM (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|tputServiceVMWrite` | Throughput service VM (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|latencyAvgServiceVMWrite` | Latency avg service VM (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|oioResyncRead` | Outstanding IO resync (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-compmgr\|oioRecoveryWrite` | Outstanding IO recovery (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+
+#### `cptvsan|Storage I/O:dom-owner` <- `host-domowner`
+
+Model kind `VsanHostDomowner`, model label "Host Domowner"; identity `host_uuid`; objects observed **4**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Storage I/O:dom-owner\|iops` | IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|throughput` | Throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvg` | Latency (average) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyStddev` | Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ioCount` | IO count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|readCongestion` | Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeCongestion` | Write Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|recoveryWriteCongestion` | Resync Read Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputRead` | Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsResyncRead` | Resync Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputResyncRead` | Resync Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgResyncRead` | Resync Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|resyncReadCount` | Resync read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputWrite` | Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsRecWrite` | Recovery Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputRecWrite` | Recovery Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgRecWrite` | Recovery Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|recWriteCount` | Recovery write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numOio` | Num outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyMaxRead` | Latency (max, read) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyMaxWrite` | Latency (max, write) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputUnmap` | Throughput unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|unmapCount` | Unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsRecUnmap` | Recovery Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputRecUnmap` | Throughput recovery unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgRecUnmap` | Recovery Unmap Latency | schema | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|recUnmapCount` | Recovery unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|unmapCongestion` | Unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|recoveryUnmapCongestion` | Recovery unmap congestion | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyMaxUnmap` | Latency max unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|readLeafOwnerLatency` | Read leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeLeafOwnerLatency` | Write leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|unmapLeafOwnerLatency` | Unmap leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|recoveryWriteLeafOwnerLatency` | Recovery write leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|recoveryUnmapLeafOwnerLatency` | Recovery unmap leaf owner latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteResyncOps` | Num complete resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteRwrOps` | Num complete rwr ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteResyncRwrBatches` | Num complete resync rwr batches | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|avgResyncParallelism` | Resync parallelism (average) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyStddevRead` | Latency standard deviation (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyStddevWrite` | Latency standard deviation (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyStddevUnmap` | Unmap Latency Std Dev | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingResyncJobs` | Num pending resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingDecomResyncJobs` | Num pending decom resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedResyncJobs` | Num suspended resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedResyncChangemaps` | Num suspended resync changemaps | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedSharedResyncJobs` | Num suspended shared resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedPriorityResyncJobs` | Num suspended priority resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numRunningResyncJobs` | Num running resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numInflightSharedResyncJobs` | Num inflight shared resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numInflightPriorityResyncJobs` | Num inflight priority resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOCount` | High outstanding IO count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOCountPercent` | High outstanding IO count percent | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOThroughput` | High outstanding IO throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOBytes` | High outstanding IO bytes | derived | `DATA_SIZE.BYTE` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIODurationMs` | High outstanding IO duration ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIODurationPercent` | High outstanding IO duration percent | derived | `RATIO.PERCENT` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIONumTimes` | High outstanding IO num times | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgOIO` | High outstanding IO avg outstanding IO | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgDurationMs` | High outstanding IO avg duration ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgIOCount` | High outstanding IO avg IO count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOCountRead` | High outstanding IO count (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOCountPercentRead` | High outstanding IO count percent (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOThroughputRead` | High outstanding IO throughput (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOBytesRead` | High outstanding IO bytes (read) | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIODurationMsRead` | High outstanding IO duration ms (read) | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIODurationPercentRead` | High outstanding IO duration percent (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIONumTimesRead` | High outstanding IO num times (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgOIORead` | High outstanding IO avg outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgDurationMsRead` | High outstanding IO avg duration ms (read) | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgIOCountRead` | High outstanding IO avg IO count (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOCountWrite` | High outstanding IO count (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOCountPercentWrite` | High outstanding IO count percent (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOThroughputWrite` | High outstanding IO throughput (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOBytesWrite` | High outstanding IO bytes (write) | derived | `DATA_SIZE.BYTE` | HCIBench `bytes` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIODurationMsWrite` | High outstanding IO duration ms (write) | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIODurationPercentWrite` | High outstanding IO duration percent (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIONumTimesWrite` | High outstanding IO num times (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgOIOWrite` | High outstanding IO avg outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgDurationMsWrite` | High outstanding IO avg duration ms (write) | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|highOIOAvgIOCountWrite` | High outstanding IO avg IO count (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readECLeafOwnerMaxLatencyAvgUs` | Read ec leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeECLeafOwnerMaxLatencyAvgUs` | Write ec leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|unmapECLeafOwnerMaxLatencyAvgUs` | Unmap ec leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingFullResyncJobs` | Num pending full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingDeltaToBaseResyncJobs` | Num pending delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingSiblingToDeltaResyncJobs` | Num pending sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numRunningFullResyncJobs` | Num running full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numRunningDeltaToBaseResyncJobs` | Num running delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numRunningSiblingToDeltaResyncJobs` | Num running sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedFullResyncJobs` | Num suspended full resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedDeltaToBaseResyncJobs` | Num suspended delta to base resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedSiblingToDeltaResyncJobs` | Num suspended sibling to delta resync jobs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|deltaSourceChanges` | Delta source changes | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|resyncsStartedAsDeltaToBase` | Resyncs started as delta to base | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|resyncsEndedAsDeltaToBase` | Resyncs ended as delta to base | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|deltaLeafGTEs` | Delta leaf gt es | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|leafGTEs` | Leaf gt es | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|totalDeltaCreationDomActiveLatency` | Delta creation DOM active latency (total) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|totalDeltaCreationDomCreationLatency` | Delta creation DOM creation latency (total) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|totalDeltasCreatedCount` | Deltas created count (total) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteDeltaToBaseResyncOps` | Num complete delta to base resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteSiblingToDeltaResyncOps` | Num complete sibling to delta resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numCompleteFullResyncOps` | Num complete full resync ops | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ownerECCacheNumCachedObjects` | Owner ec cache num cached objects | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ownerECCacheHitMissRatio` | Owner ec cache hit miss ratio | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ownerECCacheNumFailedAllocs` | Owner ec cache num failed allocs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ownerECCacheNumSuccessAllocs` | Owner ec cache num success allocs | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|avgDeltaCreationDomActiveLatency` | Delta creation DOM active latency (average) | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|avgDeltaCreationDomCreationLatency` | Delta creation DOM creation latency (average) | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readECLeafOwnerMaxLatencyUs` | Read ec leaf owner max latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeECLeafOwnerMaxLatencyUs` | Write ec leaf owner max latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|unmapECLeafOwnerMaxLatencyUs` | Unmap ec leaf owner max latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readLeafOwnerMaxLatencyAvgUs` | Read leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeLeafOwnerMaxLatencyAvgUs` | Write leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|unmapLeafOwnerMaxLatencyAvgUs` | Unmap leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ecWriteCount` | Ec write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ecStridedWriteCount` | Ec strided write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ecStridedWriteHits` | Ec strided write hits | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ecCachedWriteCount` | Ec cached write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ecCachedWriteHits` | Ec cached write hits | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|ecFswCount` | Ec fsw count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCPrepareRetryCount` | Two pc prepare retry count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCCommitCount` | Two pc commit count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCCommitSize` | Two pc commit size | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|owner2PCCommitLatencyAvgUs` | Owner2 pc commit latency avg us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCReservedLSNUsedCount` | Two pc reserved lsn used count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCReservedLSNUnusedCount` | Two pc reserved lsn unused count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCReservedLSNExhaustedCount` | Two pc reserved lsn exhausted count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|iopsSegCleanerUnmap` | IOPS seg cleaner unmap | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|segCleanerUnmapLeafOwnerLatency` | Seg cleaner unmap leaf owner latency | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|segCleanerUnmapLeafOwnerMaxLatencyAvgUs` | Seg cleaner unmap leaf owner max latency avg us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|throughputSegCleanerUnmap` | Throughput seg cleaner unmap | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgSegCleanerUnmap` | Latency avg seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyStddevSegCleanerUnmap` | Latency standard deviation seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyMaxSegCleanerUnmap` | Latency max seg cleaner unmap | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|segCleanerUnmapCongestion` | Seg cleaner unmap congestion | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|resyncReadLeafOwnerLatency` | Resync read leaf owner latency | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerIops` | Num net sched owner IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompIops` | Num net sched comp IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerRecoveryWriteIops` | Num net sched owner recovery write IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompRecoveryWriteIops` | Num net sched comp recovery write IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerResyncReadIops` | Num net sched owner resync read IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompResyncReadIops` | Num net sched comp resync read IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerIopsLimit` | Num net sched owner IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompIopsLimit` | Num net sched comp IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerRecoveryWriteIopsLimit` | Num net sched owner recovery write IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompRecoveryWriteIopsLimit` | Num net sched comp recovery write IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerResyncReadIopsLimit` | Num net sched owner resync read IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompResyncReadIopsLimit` | Num net sched comp resync read IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerTpThrottled` | Num net sched owner tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompTpThrottled` | Num net sched comp tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedRecoveryWriteTpThrottled` | Num net sched recovery write tp throttled | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedResyncReadTpThrottled` | Num net sched resync read tp throttled | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerRecoveryWriteTpThrottled` | Num net sched owner recovery write tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompRecoveryWriteTpThrottled` | Num net sched comp recovery write tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedOwnerResyncReadTpThrottled` | Num net sched owner resync read tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedCompResyncReadTpThrottled` | Num net sched comp resync read tp throttled | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedHighBand` | Num net sched high band | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedMidBand` | Num net sched mid band | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedLowBand` | Num net sched low band | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedHighBandLowLimit` | Num net sched high band low limit | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedLowBandHighLimit` | Num net sched low band high limit | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedMidBandHighLimit` | Num net sched mid band high limit | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedHighBandHighShare` | Num net sched high band high share | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedMidBandLowShare` | Num net sched mid band low share | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedLowToHighBand` | Num net sched low to high band | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedLowToMidBand` | Num net sched low to mid band | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedMidToLowBand` | Num net sched mid to low band | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedMidToHighBand` | Num net sched mid to high band | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedHighToLowBand` | Num net sched high to low band | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedHighToMidBand` | Num net sched high to mid band | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedControllerActivations` | Num net sched controller activations | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedControllerIopsLimit` | Num net sched controller IOPS limit | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedResyncTotalSharePercent` | Num net sched resync total share percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedSeenTotalTpBps` | Num net sched seen total tp bps | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedSeenResyncTpBps` | Num net sched seen resync tp bps | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedSeenNonResyncTpBps` | Num net sched seen non resync tp bps | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedHighBandSec` | Num net sched high band sec | derived | `TIME.SECONDS` | HCIBench `s` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedMidBandSec` | Num net sched mid band sec | derived | `TIME.SECONDS` | HCIBench `s` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedLowBandSec` | Num net sched low band sec | derived | `TIME.SECONDS` | HCIBench `s` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedRollingAvgLatUs` | Num net sched rolling avg latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numBlockedResyncJobs` | Num blocked resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numBlockedSharedResyncJobs` | Num blocked shared resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numBlockedPriorityResyncJobs` | Num blocked priority resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numBlockedFullResyncJobs` | Num blocked full resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numBlockedDeltaToBaseResyncJobs` | Num blocked delta to base resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numBlockedSiblingToDeltaResyncJobs` | Num blocked sibling to delta resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|oioResyncRead` | Outstanding IO resync (read) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|oioRecoveryWrite` | Outstanding IO recovery (write) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readLeafOwnerIops` | Read leaf owner IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeLeafOwnerIops` | Write leaf owner IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readLeafOwnerThroughput` | Read leaf owner throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeLeafOwnerThroughput` | Write leaf owner throughput | derived | `DATA_RATE.BIBYTE_PER_SECOND` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readLeafOwnerRetriesPerOp` | Read leaf owner retries per op | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeLeafOwnerRetriesPerOp` | Write leaf owner retries per op | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readOwnerRetriesPerOp` | Read owner retries per op | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeOwnerRetriesPerOp` | Write owner retries per op | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readLeafOwnerLatencyRemote` | Read leaf owner latency remote | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeLeafOwnerLatencyRemote` | Write leaf owner latency remote | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|resyncReadLeafOwnerLatencyRemote` | Resync read leaf owner latency remote | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|recoveryWriteLeafOwnerLatencyRemote` | Recovery write leaf owner latency remote | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|readLeafOwnerLatencyLocal` | Read leaf owner latency local | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|writeLeafOwnerLatencyLocal` | Write leaf owner latency local | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|resyncReadLeafOwnerLatencyLocal` | Resync read leaf owner latency local | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|recoveryWriteLeafOwnerLatencyLocal` | Recovery write leaf owner latency local | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|serverSwitchCount` | Server switch count | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|serverSwitchLatencyMaxUs` | Server switch latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|serverSwitchAvglatency` | Server switch average latency | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|serverSwitchlatencyStddev` | Server switchlatency standard deviation | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsNoMem` | Owner ops no mem (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsRetry` | Owner ops retry (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsNoSpace` | Owner ops no space (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsNoConnect` | Owner ops no connect (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsIoError` | Owner ops IO error (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsChecksumMismatch` | Owner ops checksum mismatch (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsLimitExceed` | Owner ops limit exceed (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsBadParam` | Owner ops bad param (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOwnerOpsNotSupported` | Owner ops not supported (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|rateOtherOwnerOpsFailure` | Other owner ops failure (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputServiceVMRead` | Throughput service VM (read) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgServiceVMRead` | Latency avg service VM (read) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|tputServiceVMWrite` | Throughput service VM (write) | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyAvgServiceVMWrite` | Latency avg service VM (write) | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedUnderUtilCount` | Net sched under utilization count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedUnderUtilGuestBps` | Net sched under utilization guest bps | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedUnderUtilTtlBps` | Net sched under utilization ttl bps | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBandwidthDiscoveryBps` | Net sched bandwidth discovery bps | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWDiscoverySessions` | Net sched bw discovery sessions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocationSessions` | Net sched bw reallocation sessions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWDiscoveryActions` | Net sched bw discovery actions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocationActions` | Net sched bw reallocation actions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedResyncGainsFromGuestCount` | Net sched resync gains from guest count | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWDiscoveryUtilizationPct` | Net sched bw discovery utilization percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedLatencyIncreaseFromResyncPerDiscoverySessionPct` | Net sched latency increase from resync per discovery session percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedGuestIopsIncreasePerReallocationSession` | Net sched guest IOPS increase per reallocation session | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedGuestIopsDecreasePerDiscoverySession` | Net sched guest IOPS decrease per discovery session | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedResyncIopsIncreasePerDiscoverySession` | Net sched resync IOPS increase per discovery session | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedResyncIopsDecreasePerReallocationSession` | Net sched resync IOPS decrease per reallocation session | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWDiscoveredPerDiscoverySession` | Net sched bw discovered per discovery session | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocatedPerReallocationSession` | Net sched bw reallocated per reallocation session | derived | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWDiscoveryStopsDueToHighLatencyPct` | Net sched bw discovery stops due to high latency percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWDiscoveryStopsDueToGainsFromGuestPct` | Net sched bw discovery stops due to gains from guest percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocationStopsDueToLowUtilizationPct` | Net sched bw reallocation stops due to low utilization percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocationStopsDueToHighSharePct` | Net sched bw reallocation stops due to high share percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWDiscoveryAvgIntervalsUs` | Net sched bw discovery avg intervals us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocationAvgIntervalsUs` | Net sched bw reallocation avg intervals us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedAvgOwnerRecoveryWriteDelayMs` | Net sched avg owner recovery write delay ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedAvgCompRecoveryWriteDelayMs` | Net sched avg comp recovery write delay ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedAvgOwnerResyncReadDelayMs` | Net sched avg owner resync read delay ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedAvgCompResyncReadDelayMs` | Net sched avg comp resync read delay ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCPrepareLimitRetryResyncIOPS` | Two pc prepare limit retry resync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCPrepareLimitRetryGuestIOPS` | Two pc prepare limit retry guest IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCPrepareLimitRetryOtherIOPS` | Two pc prepare limit retry other IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCPrepareLimitRetryResyncAvgTimeMs` | Two pc prepare limit retry resync avg time ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCPrepareLimitRetryGuestAvgTimeMs` | Two pc prepare limit retry guest avg time ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCPrepareLimitRetryOtherAvgTimeMs` | Two pc prepare limit retry other avg time ms | derived | `TIME.MILLISECONDS` | HCIBench `ms` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCBatchCommitSyncIOPS` | Two pc batch commit sync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCBatchCommitResyncIOPS` | Two pc batch commit resync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCBatchCommitGuestIOPS` | Two pc batch commit guest IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCBatchCommitOtherIOPS` | Two pc batch commit other IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCBatchCommitBlockedBySyncIOPS` | Two pc batch commit blocked by sync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCBatchCommitBlockedByResyncIOPS` | Two pc batch commit blocked by resync IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCBatchCommitBlockedByGuestIOPS` | Two pc batch commit blocked by guest IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|twoPCBatchCommitBlockedByOtherIOPS` | Two pc batch commit blocked by other IOPS | derived | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWDiscoveryStopsDueToLowUtilizationPct` | Net sched bw discovery stops due to low utilization percent | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocationUtilizationRatio` | Net sched bw reallocation utilization ratio | derived | `RATIO.PERCENT` | HCIBench `percent` | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocationUtilizationRatioBelow` | Net sched bw reallocation utilization ratio below | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedBWReallocationUtilizationRatioAbove` | Net sched bw reallocation utilization ratio above | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedGuestLTLatUs` | Num net sched guest lt latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numNetSchedLowBandThreshUs` | Num net sched low band thresh us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|Storage I/O:dom-owner\|numSuspendedDedupResyncJobs` | Num suspended dedup resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numInflightDedupResyncJobs` | Num inflight dedup resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|numPendingDedupResyncJobs` | Num pending dedup resync jobs | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyStddevResyncRead` | Latency standard deviation resync (read) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|latencyStddevRecoveryWrite` | Latency standard deviation recovery (write) | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:dom-owner\|netSchedLowBandPct` | no label in source | - | percent (by construction; not declared) | app/push.py formula | - |  | derived |
+
+#### `cptvsan|Storage I/O:remote-dom-client` <- `host-remotedomclient`
+
+Model kind `VsanHostRemotedomclient`, model label "vSAN Host Remotedomclient"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Storage I/O:remote-dom-client\|congestion` | Congestions | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:remote-dom-client\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+
+#### `cptvsan|Storage I/O:vsansparse` <- `host-vsansparse`
 
 Model kind `VsanHostVsansparse`, model label "Host Vsansparse"; identity `host_uuid`; objects observed **4**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Storage I/O\|vsanSparse\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|iopsGwe` | GWE IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|iopsRmw` | RMW IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|iopsWriteConflicts` | Write Conficts IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|latencyGwe` | GWE Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|latencyCacheLookup` | Cache Lookup Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|cacheInserts` | Cache inserts | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|cacheRemoves` | Cache removes | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|cacheEntries` | Cache entries | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|cacheAllocFails` | Cache alloc fails | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|cacheEvictAttempts` | Cache evict attempts | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|lruLockContentions` | Lru lock contentions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|cacheLockContentions` | Cache lock contentions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|cacheUpdateLatency` | Cache update latency | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|cacheHitRate` | Cache Hit Rate | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
-| `cptvsan\|Storage I/O\|vsanSparse\|readsToLayer` | Reads to layer | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|iopsGwe` | GWE IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|iopsRmw` | RMW IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|iopsWriteConflicts` | Write Conficts IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|latencyGwe` | GWE Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|latencyCacheLookup` | Cache Lookup Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|cacheInserts` | Cache inserts | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|cacheRemoves` | Cache removes | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|cacheEntries` | Cache entries | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|cacheAllocFails` | Cache alloc fails | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|cacheEvictAttempts` | Cache evict attempts | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|lruLockContentions` | Lru lock contentions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|cacheLockContentions` | Cache lock contentions | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|cacheUpdateLatency` | Cache update latency | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|cacheHitRate` | Cache Hit Rate | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+| `cptvsan\|Storage I/O:vsansparse\|readsToLayer` | Reads to layer | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
 
-#### `cptvsan|zDOM|Top Stats` <- `host-zdom-top-stats`
+#### `cptvsan|iSCSI:host` <- `vsan-iscsi-host`
+
+Model kind `VsanIscsiHost`, model label "vSAN iSCSI Host"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|iSCSI:host\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:host\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:host\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:host\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:host\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:host\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:host\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:host\|latencyTotal` | Total Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:host\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:host\|queueDepth` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+
+#### `cptvsan|iSCSI:lun-{target}-{lun}` <- `vsan-iscsi-lun`
+
+Model kind `VsanIscsiLun`, model label "vSAN iSCSI LUN"; identity `host_uuid`, `target`, `lun`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|latencyTotal` | Total Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:lun-{target}-{lun}\|queueDepth` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+
+#### `cptvsan|iSCSI:target-{target}` <- `vsan-iscsi-target`
+
+Model kind `VsanIscsiTarget`, model label "vSAN iSCSI Target"; identity `host_uuid`, `target`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|iSCSI:target-{target}\|bandwidthRead` | Read Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:target-{target}\|bandwidthTotal` | Total Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:target-{target}\|bandwidthWrite` | Write Bandwidth | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|iSCSI:target-{target}\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:target-{target}\|iopsTotal` | Total IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:target-{target}\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|iSCSI:target-{target}\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:target-{target}\|latencyTotal` | Total Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:target-{target}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|iSCSI:target-{target}\|queueDepth` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | number |  |  |
+
+#### `cptvsan|vSAN Direct:cluster` <- `vsan-direct-cluster`
+
+Model kind `VsanDirectCluster`, model label "vSAN Direct Cluster"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|vSAN Direct:cluster\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|vSAN Direct:cluster\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|vSAN Direct:cluster\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|vSAN Direct:cluster\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|vSAN Direct:cluster\|oioDevRead` | Read Outstanding IO | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|vSAN Direct:cluster\|oioDevWrite` | Write Outstanding IO | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|vSAN Direct:cluster\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|vSAN Direct:cluster\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+
+#### `cptvsan|vSAN Direct:host` <- `vsan-direct-host`
+
+Model kind `VsanDirectHost`, model label "vSAN Direct Host"; identity `host_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|vSAN Direct:host\|iopsDevRead` | Physical-layer Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|vSAN Direct:host\|iopsDevWrite` | Physical-layer Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|vSAN Direct:host\|latencyDevRead` | Physical-layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|vSAN Direct:host\|latencyDevWrite` | Physical-layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|vSAN Direct:host\|oioDevRead` | Read Outstanding IO | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|vSAN Direct:host\|oioDevWrite` | Write Outstanding IO | schema | unit unknown | none (no HCIBench entry, no name rule) | number | V |  |
+| `cptvsan\|vSAN Direct:host\|throughputDevRead` | Physical-layer Read Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|vSAN Direct:host\|throughputDevWrite` | Physical-layer Write Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+
+#### `cptvsan|zDOM` <- `host-zdom-top-stats`
 
 Model kind `VsanHostZdomTopStats`, model label "Host Zdom Top Stats"; identity `host_uuid`; objects observed **4**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|zDOM\|Top Stats\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|zDOM\|Top Stats\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|zDOM\|Top Stats\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|zDOM\|Top Stats\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|zDOM\|Top Stats\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|zDOM\|Top Stats\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|zDOM\|Top Stats\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|unmapCount` | Unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|ioCount` | IO count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|Top Stats\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|zDOM\|Top Stats\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|zDOM\|Top Stats\|readLatencyMaxUs` | Read latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|zDOM\|Top Stats\|writeLatencyMaxUs` | Write latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
-| `cptvsan\|zDOM\|Top Stats\|unmapLatencyMaxUs` | Unmap latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|zDOM\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|zDOM\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|zDOM\|latencyAvgRead` | Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|zDOM\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|zDOM\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|zDOM\|latencyAvgWrite` | Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|zDOM\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|iopsUnmap` | Unmap IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | - |  |  |
+| `cptvsan\|zDOM\|throughputUnmap` | Unmap Throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | - |  |  |
+| `cptvsan\|zDOM\|latencyAvgUnmap` | Unmap Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|unmapCount` | Unmap count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|ioCount` | IO count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|oioRead` | Outstanding IO (read) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|oioWrite` | Outstanding IO (write) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|zDOM\|oio` | Outstanding IO | schema | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|zDOM\|readLatencyMaxUs` | Read latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|zDOM\|writeLatencyMaxUs` | Write latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
+| `cptvsan\|zDOM\|unmapLatencyMaxUs` | Unmap latency max us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - | V |  |
 
-#### `cptvsan|zDOM|VTX` <- `zdom-vtx`
+#### `cptvsan|zDOM` <- `zdom-vtx`
 
 Model kind `VsanZdomVtx`, model label "Zdom Vtx"; identity `host_uuid`; objects observed **4**; live model.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|zDOM\|VTX\|rateTxnReadWrite` | Transaction (read, write, rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|zDOM\|VTX\|rateTotalCacheMiss` | Cache miss (rate, total) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTotalCacheRef` | Cache ref (rate, total) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|zDOM\|VTX\|rateBankFlushTotalCacheRef` | Bank flush total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|zDOM\|VTX\|rateSegCleaningCtxDataTotalCacheRef` | Seg cleaning context data total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|zDOM\|VTX\|latAvgCacheGet` | Latency avg cache get | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|latAvgTotalOpIO` | Latency avg total op IO | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|zDOM\|VTX\|allOpCacheMaxGetLatUSec` | All op cache max get latency u sec | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnPrefetchTotalCacheRef` | Transaction prefetch total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnPrefetchLogicalTreeCacheRef` | Transaction prefetch logical tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnPrefetchMiddleTreeCacheRef` | Transaction prefetch middle tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnPrefetchSutCacheRef` | Transaction prefetch sut cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnPrefetchTotalCacheMiss` | Transaction prefetch total cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnPrefetchLogicalTreeCacheMiss` | Transaction prefetch logical tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnPrefetchMiddleTreeCacheMiss` | Transaction prefetch middle tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnPrefetchSutCacheMiss` | Transaction prefetch sut cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnBankTotalCacheRef` | Transaction bank total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnBankLogicalTreeCacheRef` | Transaction bank logical tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnBankMiddleTreeCacheRef` | Transaction bank middle tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnBankSutCacheRef` | Transaction bank sut cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnBankTotalCacheMiss` | Transaction bank total cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnBankLogicalTreeCacheMiss` | Transaction bank logical tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnBankMiddleTreeCacheMiss` | Transaction bank middle tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnBankSutCacheMiss` | Transaction bank sut cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|latAvgTxnBank` | Latency avg transaction bank | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
-| `cptvsan\|zDOM\|VTX\|latAvgTxnBankTotalIO` | Latency avg transaction bank total IO | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|maxDiscUsedPct` | Disc used percent (max) | derived | `RATIO.PERCENT` | HCIBench `percent` | - | V |  |
-| `cptvsan\|zDOM\|VTX\|checkpointWorkerWakeupMs` | Checkpoint worker wakeup ms | derived | `TIME.MILLISECONDS` | hand override (UNIT_OVERRIDE) | - | V |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnUnmapTotalCacheMiss` | Transaction unmap total cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnUnmapLogicalTreeCacheMiss` | Transaction unmap logical tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnUnmapMiddleTreeCacheMiss` | Transaction unmap middle tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnUnmapSutCacheMiss` | Transaction unmap sut cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|latAvgTxnUnmap` | Latency avg transaction unmap | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|latAvgTxnUnmapTotalIO` | Latency avg transaction unmap total IO | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnSegCleaningCtxDataTotalCacheRef` | Transaction seg cleaning context data total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnSegCleaningCtxDataLogicalTreeCacheRef` | Transaction seg cleaning context data logical tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnSegCleaningCtxDataMiddleTreeCacheRef` | Transaction seg cleaning context data middle tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnSegCleaningCtxDataSutCacheRef` | Transaction seg cleaning context data sut cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnSegCleaningCtxDataTotalCacheMiss` | Transaction seg cleaning context data total cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnSegCleaningCtxDataLogicalTreeCacheMiss` | Transaction seg cleaning context data logical tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnSegCleaningCtxDataMiddleTreeCacheMiss` | Transaction seg cleaning context data middle tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnSegCleaningCtxDataSutCacheMiss` | Transaction seg cleaning context data sut cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnLookupCacheRef` | Transaction lookup cache ref (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnLookupLogicalTreeCacheRef` | Transaction lookup logical tree cache ref (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnLookupMiddleTreeCacheRef` | Transaction lookup middle tree cache ref (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnLookupCacheMiss` | Transaction lookup cache miss (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnLookupLogicalTreeCacheMiss` | Transaction lookup logical tree cache miss (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTxnLookupMiddleTreeCacheMiss` | Transaction lookup middle tree cache miss (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTotalLogicalTreeCacheMiss` | Logical tree cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTotalMiddleTreeCacheMiss` | Middle tree cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTotalSnapTreeCacheMiss` | Snap tree cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTotalBitmapCacheMiss` | Bitmap cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTotalSutCacheMiss` | Sut cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|cacheMissPerPrefetchTxn` | Cache miss per prefetch transaction | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|cacheMissPerSegCleaningCtxDataTxn` | Cache miss per seg cleaning context data transaction | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|cacheMissPerLookupTxn` | Cache miss per lookup transaction | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnDLogMaxLatUs` | Transaction d log max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnBankMaxLatUs` | Transaction bank max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnSegCtxDataMaxLatUs` | Transaction seg context data max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnSegCtxLLPMaxLatUs` | Transaction seg context llp max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnVatWriteSegMaxLatUs` | Transaction vat write seg max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnUnmapMaxLatUs` | Transaction unmap max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnCacheFlushMaxLatUs` | Transaction cache flush max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnDelExtMiddleTreeMaxLatUs` | Transaction del ext middle tree max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnPrefetchMaxLatUs` | Transaction prefetch max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|txnLookupMaxLatUs` | Transaction lookup max latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|prefetchCacheMaxGetLatUs` | Prefetch cache max get latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
-| `cptvsan\|zDOM\|VTX\|iopsCacheMissRate` | Cache Miss Per IOPS | schema | `RATIO.PERCENT` | hand override (UNIT_OVERRIDE) | percentage |  |  |
-| `cptvsan\|zDOM\|VTX\|tputCacheMissRate` | Cache Miss Per Throughput | schema | `RATIO.PERCENT` | hand override (UNIT_OVERRIDE) | percentage |  |  |
-| `cptvsan\|zDOM\|VTX\|missesPerIO` | Misses per IO | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
-| `cptvsan\|zDOM\|VTX\|rateTotDirtyCachePage` | Tot dirty cache page (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnReadWrite` | Transaction (read, write, rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|zDOM\|rateTotalCacheMiss` | Cache miss (rate, total) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTotalCacheRef` | Cache ref (rate, total) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|zDOM\|rateBankFlushTotalCacheRef` | Bank flush total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|zDOM\|rateSegCleaningCtxDataTotalCacheRef` | Seg cleaning context data total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|zDOM\|latAvgCacheGet` | Latency avg cache get | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|latAvgTotalOpIO` | Latency avg total op IO | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|zDOM\|allOpCacheMaxGetLatUSec` | All op cache max get latency u sec | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|rateTxnPrefetchTotalCacheRef` | Transaction prefetch total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
+| `cptvsan\|zDOM\|rateTxnPrefetchLogicalTreeCacheRef` | Transaction prefetch logical tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnPrefetchMiddleTreeCacheRef` | Transaction prefetch middle tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnPrefetchSutCacheRef` | Transaction prefetch sut cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnPrefetchTotalCacheMiss` | Transaction prefetch total cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnPrefetchLogicalTreeCacheMiss` | Transaction prefetch logical tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnPrefetchMiddleTreeCacheMiss` | Transaction prefetch middle tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnPrefetchSutCacheMiss` | Transaction prefetch sut cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnBankTotalCacheRef` | Transaction bank total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnBankLogicalTreeCacheRef` | Transaction bank logical tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnBankMiddleTreeCacheRef` | Transaction bank middle tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnBankSutCacheRef` | Transaction bank sut cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnBankTotalCacheMiss` | Transaction bank total cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnBankLogicalTreeCacheMiss` | Transaction bank logical tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnBankMiddleTreeCacheMiss` | Transaction bank middle tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnBankSutCacheMiss` | Transaction bank sut cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|latAvgTxnBank` | Latency avg transaction bank | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - | V |  |
+| `cptvsan\|zDOM\|latAvgTxnBankTotalIO` | Latency avg transaction bank total IO | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|maxDiscUsedPct` | Disc used percent (max) | derived | `RATIO.PERCENT` | HCIBench `percent` | - | V |  |
+| `cptvsan\|zDOM\|checkpointWorkerWakeupMs` | Checkpoint worker wakeup ms | derived | `TIME.MILLISECONDS` | hand override (UNIT_OVERRIDE) | - | V |  |
+| `cptvsan\|zDOM\|rateTxnUnmapTotalCacheMiss` | Transaction unmap total cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnUnmapLogicalTreeCacheMiss` | Transaction unmap logical tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnUnmapMiddleTreeCacheMiss` | Transaction unmap middle tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnUnmapSutCacheMiss` | Transaction unmap sut cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|latAvgTxnUnmap` | Latency avg transaction unmap | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|latAvgTxnUnmapTotalIO` | Latency avg transaction unmap total IO | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|rateTxnSegCleaningCtxDataTotalCacheRef` | Transaction seg cleaning context data total cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnSegCleaningCtxDataLogicalTreeCacheRef` | Transaction seg cleaning context data logical tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnSegCleaningCtxDataMiddleTreeCacheRef` | Transaction seg cleaning context data middle tree cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnSegCleaningCtxDataSutCacheRef` | Transaction seg cleaning context data sut cache ref (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnSegCleaningCtxDataTotalCacheMiss` | Transaction seg cleaning context data total cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnSegCleaningCtxDataLogicalTreeCacheMiss` | Transaction seg cleaning context data logical tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnSegCleaningCtxDataMiddleTreeCacheMiss` | Transaction seg cleaning context data middle tree cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnSegCleaningCtxDataSutCacheMiss` | Transaction seg cleaning context data sut cache miss (rate) | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnLookupCacheRef` | Transaction lookup cache ref (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - | V |  |
+| `cptvsan\|zDOM\|rateTxnLookupLogicalTreeCacheRef` | Transaction lookup logical tree cache ref (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnLookupMiddleTreeCacheRef` | Transaction lookup middle tree cache ref (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnLookupCacheMiss` | Transaction lookup cache miss (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnLookupLogicalTreeCacheMiss` | Transaction lookup logical tree cache miss (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTxnLookupMiddleTreeCacheMiss` | Transaction lookup middle tree cache miss (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTotalLogicalTreeCacheMiss` | Logical tree cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTotalMiddleTreeCacheMiss` | Middle tree cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTotalSnapTreeCacheMiss` | Snap tree cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTotalBitmapCacheMiss` | Bitmap cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTotalSutCacheMiss` | Sut cache miss (rate, total) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|cacheMissPerPrefetchTxn` | Cache miss per prefetch transaction | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|cacheMissPerSegCleaningCtxDataTxn` | Cache miss per seg cleaning context data transaction | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|cacheMissPerLookupTxn` | Cache miss per lookup transaction | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|txnDLogMaxLatUs` | Transaction d log max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnBankMaxLatUs` | Transaction bank max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnSegCtxDataMaxLatUs` | Transaction seg context data max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnSegCtxLLPMaxLatUs` | Transaction seg context llp max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnVatWriteSegMaxLatUs` | Transaction vat write seg max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnUnmapMaxLatUs` | Transaction unmap max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnCacheFlushMaxLatUs` | Transaction cache flush max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnDelExtMiddleTreeMaxLatUs` | Transaction del ext middle tree max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnPrefetchMaxLatUs` | Transaction prefetch max latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|txnLookupMaxLatUs` | Transaction lookup max latency us | derived | `TIME.MICROSECONDS` | name rule (_unit_from_name) | - |  |  |
+| `cptvsan\|zDOM\|prefetchCacheMaxGetLatUs` | Prefetch cache max get latency us | derived | `TIME.MICROSECONDS` | HCIBench `µs` | - |  |  |
+| `cptvsan\|zDOM\|iopsCacheMissRate` | Cache Miss Per IOPS | schema | `RATIO.PERCENT` | hand override (UNIT_OVERRIDE) | percentage |  |  |
+| `cptvsan\|zDOM\|tputCacheMissRate` | Cache Miss Per Throughput | schema | `RATIO.PERCENT` | hand override (UNIT_OVERRIDE) | percentage |  |  |
+| `cptvsan\|zDOM\|missesPerIO` | Misses per IO | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
+| `cptvsan\|zDOM\|rateTotDirtyCachePage` | Tot dirty cache page (rate) | derived | unit unknown | none (no HCIBench entry, no name rule) | - |  |  |
 
 ### 7.3 Virtual machine (VirtualMachine)
 
-#### `cptvsan|VM` <- `virtual-machine`
-
-Model kind `VsanVirtualMachine`, model label "vSAN Virtual Machine"; identity `vm_uuid`; objects observed **30**; live model.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|VM\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|VM\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|VM\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|VM\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-| `cptvsan\|VM\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
-| `cptvsan\|VM\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
-| `cptvsan\|VM\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
-| `cptvsan\|VM\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
-
-#### `cptvsan|VM (Remote)` <- `remote-virtual-machine`
+#### `cptvsan|VM:remote` <- `remote-virtual-machine`
 
 Model kind `VsanRemoteVirtualMachine`, model label "vSAN Remote Virtual Machine"; identity `vm_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|VM (Remote)\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|VM (Remote)\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|VM (Remote)\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|VM (Remote)\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|VM (Remote)\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|VM (Remote)\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|VM:remote\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|VM:remote\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|VM:remote\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|VM:remote\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|VM:remote\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|VM:remote\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+
+#### `cptvsan|VM:local` <- `virtual-machine`
+
+Model kind `VsanVirtualMachine`, model label "vSAN Virtual Machine"; identity `vm_uuid`; objects observed **30**; live model.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|VM:local\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|VM:local\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|VM:local\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|VM:local\|readCount` | Read count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+| `cptvsan\|VM:local\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
+| `cptvsan\|VM:local\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes | V |  |
+| `cptvsan\|VM:local\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
+| `cptvsan\|VM:local\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - |  |  |
+
+#### `cptvsan|Virtual Disk:remote-{disk_uuid}` <- `remote-virtual-disk`
+
+Model kind `VsanRemoteVirtualDisk`, model label "vSAN Remote Virtual Disk"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+
+| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
+|---|---|---|---|---|---|---|---|
+| `cptvsan\|Virtual Disk:remote-{disk_uuid}\|NIOPS` | Normalized IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Virtual Disk:remote-{disk_uuid}\|NIOPSDelayed` | Delayed Normalized IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|Virtual Disk:remote-{disk_uuid}\|iopsLimit` | Normalized IOPS Limit | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
 
 #### `cptvsan|Virtual Disk:{vdisk_uuid}` <- `virtual-disk`
 
@@ -3247,15 +3216,18 @@ Model kind `VsanVirtualDisk`, model label "vSAN Virtual Disk"; identity `vdisk_u
 | `cptvsan\|Virtual Disk:{vdisk_uuid}\|NIOPSWriteDelayed` | Niops write delayed | derived | `MISC.IO_OPERATIONS_PER_SECOND` | name rule (_unit_from_name) | - | V |  |
 | `cptvsan\|Virtual Disk:{vdisk_uuid}\|NIOPSDelayed` | Delayed Normalized IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number | V |  |
 
-#### `cptvsan|Virtual Disk (Remote):{disk_uuid}` <- `remote-virtual-disk`
+#### `cptvsan|vSCSI:remote-{device}` <- `remote-vscsi`
 
-Model kind `VsanRemoteVirtualDisk`, model label "vSAN Remote Virtual Disk"; identity `disk_uuid`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
+Model kind `VsanRemoteVscsi`, model label "vSAN Remote Vscsi"; identity `vm_uuid`, `device`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
 
 | Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
 |---|---|---|---|---|---|---|---|
-| `cptvsan\|Virtual Disk (Remote):{disk_uuid}\|NIOPS` | Normalized IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Virtual Disk (Remote):{disk_uuid}\|NIOPSDelayed` | Delayed Normalized IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|Virtual Disk (Remote):{disk_uuid}\|iopsLimit` | Normalized IOPS Limit | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|vSCSI:remote-{device}\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|vSCSI:remote-{device}\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
+| `cptvsan\|vSCSI:remote-{device}\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|vSCSI:remote-{device}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
+| `cptvsan\|vSCSI:remote-{device}\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
+| `cptvsan\|vSCSI:remote-{device}\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
 
 #### `cptvsan|vSCSI:{device}` <- `vscsi`
 
@@ -3272,19 +3244,6 @@ Model kind `VsanVscsi`, model label "vSAN vSCSI"; identity `vm_uuid`, `device`; 
 | `cptvsan\|vSCSI:{device}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms | V |  |
 | `cptvsan\|vSCSI:{device}\|writeCount` | Write count | derived | unit unknown | none (HCIBench `short` is dimensionless) | - | V |  |
 
-#### `cptvsan|vSCSI (Remote):{device}` <- `remote-vscsi`
-
-Model kind `VsanRemoteVscsi`, model label "vSAN Remote Vscsi"; identity `vm_uuid`, `device`; objects observed **0**; PROVISIONAL (inferred, advertised metrics); feature-specific.
-
-| Key | Label | Label src | Unit | Authority | Schema unit | V | Notes |
-|---|---|---|---|---|---|---|---|
-| `cptvsan\|vSCSI (Remote):{device}\|iopsRead` | Read IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|vSCSI (Remote):{device}\|iopsWrite` | Write IOPS | schema | `MISC.IO_OPERATIONS_PER_SECOND` | HCIBench `iops` | number |  |  |
-| `cptvsan\|vSCSI (Remote):{device}\|latencyRead` | vSAN Layer Read Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|vSCSI (Remote):{device}\|latencyWrite` | vSAN Layer Write Latency | schema | `TIME.MICROSECONDS` | HCIBench `µs` | time_ms |  |  |
-| `cptvsan\|vSCSI (Remote):{device}\|throughputRead` | Read throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-| `cptvsan\|vSCSI (Remote):{device}\|throughputWrite` | Write throughput | schema | `DATA_RATE.BIBYTE_PER_SECOND` | HCIBench `binBps` | rate_bytes |  |  |
-
 ## 8. Collection scope and cost
 
 * **Default: everything.** `perfsvc.collect(scope=None)` queries every
@@ -3292,13 +3251,18 @@ Model kind `VsanRemoteVscsi`, model label "vSAN Remote Vscsi"; identity `vm_uuid
   adapter passes no scope. (`app/metric_scope.py`, a list of metrics
   referenced by shipped views, still exists but the 2.0.0 adapter does not use
   it.)
-* **One `VsanPerfQueryPerf` per entity type per cluster per cycle** --
-  69 round trips per cluster. The service returns every metric of an
+* **One `VsanPerfQueryPerf` per entity type per cluster** -- 69
+  round trips per cluster per full pass (CORE types every cycle, HEAVY types
+  every 3rd; see "Collection cadence" below). The service returns every metric of an
   entity type in one call, so narrowing the metric set saves Operations
   storage, never a round trip; only skipping whole entity types saves time.
-  (`VsanPerfQuerySpec.labels` could filter server-side; it is unused.) The
-  code's own measurement: a full collection took 13.1 s on a four-host lab,
-  against 0.08 s to connect and list clusters.
+  (`VsanPerfQuerySpec.labels` filters server-side; the adapter sends it when
+  `query_labels` is `true`, the default.) Measured on a single-cluster,
+  four-host lab: a cycle took about 4.7 s and made about 34 vCenter calls;
+  vCenter serialises vSAN performance queries at roughly 7 calls per second,
+  so cycle time scales with the number of clusters per vCenter (about 30
+  calls per cluster per cycle). A projection, not a measurement: about 110 s
+  for 25 clusters on one vCenter.
 * **Feature-specific entity types** (`perfsvc.FEATURE_ENTITIES`,
   26 types) return nothing, or fault `NotSupported` /
   `InvalidArgument`, when the feature is off. They are QUERIED by default so a
@@ -3320,8 +3284,9 @@ Model kind `VsanRemoteVscsi`, model label "vSAN Remote Vscsi"; identity `vm_uuid
   (`objects_observed = 0`) and are NOT in `FEATURE_ENTITIES`, so `skip` does
   not remove them -- chiefly the OSA families, which are silent on ESA:
   `cache-disk`, `capacity-disk`, `clom-disk`, `clom-host`, `cluster-resync`, `cmmds-workload`, `ddh-disk`, `disk-group`, `heap-memory`, `lsom-world-cpu`, `slab-memory`, `vsan-distribution`.
-* **Per target per cycle** in Operations: one stats POST and one properties
-  POST; plus one paged `GET api/resources` listing per VMware kind.
+* **Per cycle** in Operations: batch stats and properties POSTs (up to 100
+  objects or 1 MB each by default), plus a paged `GET api/resources` listing
+  per VMware kind only when the id cache expires.
 * **Volume.** On the lab the live model was harvested from, host-scoped
   per-instance types dominate: `dom-world-cpu` 315
   objects, `host-cpu` 244, `vscsi`
@@ -3329,57 +3294,99 @@ Model kind `VsanRemoteVscsi`, model label "vSAN Remote Vscsi"; identity `vm_uuid
   60 (4 hosts, 30 VMs). `host-domowner`
   alone has 288 metrics per host.
 
+### Collection cadence
+
+2.0.0 splits collection in two. **CORE** entity types
+(56 of the 69 in `TREE`) are
+queried every 5-minute cycle. **HEAVY** types (13) are
+rotated: each is queried every 3rd cycle, over a 15-minute backfill window, and
+every 5-minute sample in that window is pushed with **its own timestamp**
+(the window starts at the newest sample already pushed and reaches back at most
+`max_backfill_minutes`, default 60, after an outage). So
+the time series of a HEAVY metric has the same 5-minute resolution as a CORE
+one; it simply arrives up to 15 minutes later. A HEAVY type therefore costs one
+round trip per cluster per 15 minutes instead of three. The buckets are
+assigned deterministically by nominal weight (`cadence.assign_buckets`) so
+each cycle carries about the same load.
+
+**Skipping what is empty or unsupported.** A type that returned no entity for a
+cluster (a feature not in use) is remembered and not queried again for
+`empty_recheck_minutes` (default 60; 0 queries every type every cycle). The
+memory is dropped at once when a host or disk is added to or removed from the
+cluster. `cluster-resync` is the exception: its entities exist only while a
+resync runs, so it is always probed. A type the cluster does not support
+(`NotSupported` / `InvalidArgument`) is remembered for 6 hours.
+
+**Protecting vCenter.** At most `vcenter_concurrency` calls (default 4) are in
+flight per vCenter, shared by every adapter instance in the same collector
+container that collects it. The limit is halved when vCenter faults or slows
+down and raised one step after that many clean calls. Cluster queries start
+spread over `stagger_seconds` (default 30), at most `cluster_concurrency`
+clusters at once. Responses are requested gzip-compressed (`vcenter_gzip`).
+Inventory is read incrementally with `WaitForUpdatesEx` and in full once an
+hour.
+
+| HEAVY family | Entity types |
+|---|---|
+| per-core / per-world CPU | `host-cpu`, `dom-world-cpu`, `lsom-world-cpu` |
+| vSCSI | `vscsi`, `remote-vscsi` |
+| heap / slab memory | `heap-memory`, `slab-memory` |
+| placement | `clom-host`, `cmmds-workload`, `vsan-distribution` |
+| DDH / CLOM disk | `ddh-disk`, `clom-disk` |
+| IOInsight | `ioinsight` |
+
+
 ## 9. Known gaps, conflicts and open questions
 
 Each item is phrased as a question; suggestions are the point of this document.
 
 ### 9.1 Tree shape
 
-1. **Disk instances are UUIDs, not friendly names.** `Disks|ESA Disk:<disk_uuid>`
+1. **Disk instances are UUIDs, not friendly names.** `Disk:<disk_uuid>`
    etc. A readable `name` property is pushed per instance when resolvable,
    but the KEY carries the uuid. Should the instance be a stable friendly
    name (canonical device name? serial?) -- and what is stable enough to keep
    history across a disk replacement or a host rename?
-2. **CPU aggregate instance `(all)`.** `host-cpu` returns a per-host aggregate
-   with no `cpu` part, which becomes `CPU|Core:(all)` alongside
-   `CPU|Core:cpu-0` ... Should the aggregate be its own non-instanced group
-   (e.g. `CPU|Core Total`) instead of a magic instance?
+2. **CPU aggregate instance.** `host-cpu` returns a per-host aggregate
+   with no `cpu` part, which becomes `cptvsan|CPU:cores-total` alongside
+   `cptvsan|CPU:core-cpu-8` ... Should the aggregate be its own variant (e.g.
+   `CPU:cores-total`) instead of a magic device value?
 3. **`/` and other characters in instances and group names.** Sanitising only
    replaces `:` and `|`. Virtual-disk instances contain `/`
    (`<namespace-uuid>/<file>.vmdk`), iSCSI IQNs lose their colons, and two
-   group names contain `/` (`Network|TCP/IP Stack`, `Storage I/O|...`). Is
+   group names contain `/` (`Network|TCP/IP Stack`, `Storage I/O`). Is
    `/` safe in Operations metric keys and in content-factory key handling?
    Should virtual-disk instances use the VM's disk label (`Hard disk 1`)?
-4. **OSA vs ESA grouping.** ESA disks are `Disks|ESA Disk`; OSA are
-   `Disks|OSA|Cache Disk`, `Disks|OSA|Capacity Disk`, `Disks|OSA|Disk Group`.
-   Should both architectures share one `Disks|...` shape (e.g.
-   `Disks|Physical:<disk>` with architecture as a property), so content can be
-   written once?
-5. **Two entity types share one group.** `vsan-esa-disk-layer` and
-   `vsan-esa-disk-scsifw` both write `Disks|ESA Disk:<disk_uuid>` (vSAN layer
-   vs physical/firmware layer). Their metric ids do not collide today, but
-   their properties are written twice. Merge deliberately, or split into
-   `Disks|ESA Disk|vSAN Layer` / `|Device Layer`?
-6. **Cluster vs host duplication of DOM layers.** `Storage I/O|DOM Client`,
-   `DOM Owner`, `DOM Component Manager`, `zDOM|Top Stats`, `ESA Dedup|*` and
-   `Services|PMEM` exist with the same group name on both the cluster and the
-   host. Is identical naming across kinds what content-factory wants (one
-   widget definition, two subject kinds), or should scope be explicit in the
-   key?
-7. **Remote/local as separate groups.** `VM` vs `VM (Remote)`, `Virtual Disk`
-   vs `Virtual Disk (Remote)`, `vSCSI` vs `vSCSI (Remote)`,
-   `Storage I/O|Remote DOM Client` vs `... (Compute)`. Would a `Local|Remote`
-   level, or a `Remote` sub-group, read better -- and should it wait until the
-   remote identities are observed rather than inferred (section 4.4)?
+4. **One `Disk` group for every architecture and role.** 6 entity
+   types write `Disk:<disk_uuid>` (section 5). The key no longer says whether a
+   disk is ESA, OSA cache or OSA capacity, and OSA disks and ESA disks share
+   8 device-layer metric ids. Should architecture and role be a
+   pushed property of the disk instance, so content can filter on it? And
+   should `Disk Group` (kept separate, keyed by an inferred `disk_uuid`) stay a
+   group of its own?
+5. **Variant and device instances share one syntax.** `Storage I/O:dom-owner`
+   (a variant) and `Network|Physical NIC:vmnic0` (a device) look alike. A view
+   about one variant must bind it by name; a device view uses the `*`
+   wildcard, which also matches a sibling's prefixed devices where metric ids
+   coincide (`vSCSI:remote-<device>` rows appear in a `vSCSI:*` view). Is a
+   prefix convention (`core-`, `remote-`, `heap-`) enough for content-factory,
+   or should variants be a separate key level?
+6. **Cluster vs host duplication.** `ESA Dedup`, `PMEM`, `Storage I/O`, `zDOM` exist with the same group
+   name on both the cluster and the host. Is identical naming across kinds
+   what content-factory wants (one widget definition, two subject kinds), or
+   should scope be explicit in the key?
+7. **Merged non-instanced groups.** `Network|Host` (HostSystem), `Placement` (HostSystem), `zDOM` (HostSystem) each hold several entity
+   types with no instance to tell them apart. Safe only while their metric ids
+   stay disjoint -- see "Keys two entity types would both write" in section 5.
+   A future schema adding a shared id would silently interleave two series.
 8. **`vsan-vnic-net` drops its `stack` part.** Instance is `{vmknic}` only;
    the ref carries `host_uuid|stack|vmknic`. Safe while a vmknic belongs to one
    stack. Keep?
-9. **Name collisions inside a target.** `Network|RDT|Cluster Latency` is on
-   the cluster and `Network|RDT|Host Latency` on the host -- but
-   `vsan-direct-cluster` lands on the HOST as `Services|vSAN Direct Cluster`.
-   Is that name misleading?
-10. **`(Remote)`, `(Compute)` in parentheses** inside group names -- fine for
-    content-factory, or should qualifiers be separate levels?
+9. **Cluster-sounding variant on a host.** `vsan-direct-cluster` lands on the
+   HOST as `vSAN Direct:cluster`, beside `vSAN Direct:host`. Is that name
+   misleading?
+10. **Reserved groups.** `Fibre Channel`, `Object Store` are reserved with no source (section 5).
+    Are these the right names for content-factory to plan around?
 
 ### 9.2 Units and semantics
 
@@ -3407,19 +3414,11 @@ Each item is phrased as a question; suggestions are the point of this document.
 
 ### 9.4 Contradictions found in the repository's own sources
 
-* `docs/soap/README.md` says `VsanPerfQueryPerf` takes an `entityRefId` "per
-  entity type -- 31 of them"; the merged model has 69 (31 is the count
-  in the live model alone).
 * `app/perfsvc_model.py`'s docstring says "39 of 70 entity types return
   nothing"; the merged model has 69 types, 38 of them
   never observed.
-* `app/perfsvc.py` `build_disk_hardware` mentions "its 1,035 metrics"; the
-  merged model has 1636 (entity, metric)
-  pairs and 989 distinct ids.
 * `perfsvc.metrics_for` cites "201 such pairs" of `Actual` twins (counted
   across objects); the model has 41 (entity, metric) `Actual` twins.
-* The SOAP README's "<5-minute window yields one sample" is a technique for a
-  no-code client; the adapter uses a 15-minute window and the last sample.
 
 ## 10. How to propose a change
 
@@ -3427,8 +3426,9 @@ Each item is phrased as a question; suggestions are the point of this document.
   `sanitize_instance`) is the ONLY place a key is shaped. `app/push.py` builds
   every pushed key through it; `tools/build_view.py` derives every view
   column's key from it (and fails the build if its own instance-wildcard form
-  ever disagrees with `build_key`); help text (`where_it_lives`) is derived
-  from it too. Propose changes as edits to `TREE` rows (target kind, group
+  ever disagrees with `build_key`); a view about one VARIANT binds that
+  instance by name (`Storage I/O:dom-owner`), a DEVICE view uses the `*`
+  wildcard. Help text (`where_it_lives`) is derived from it too. Propose changes as edits to `TREE` rows (target kind, group
   path, instance template) or to `sanitize_instance`.
 * **Cost: history continuity.** A key is the identity of a time series in
   Operations. Renaming a group, changing an instance template, or changing
@@ -3473,7 +3473,7 @@ written to be argued with.
   (metric ids its Grafana dashboards chart -- the ENTITY TYPE behind those ids
   is not recorded, so a hit there says only that some source emits such an id),
   and the method names of the vendored vSAN Management API bindings
-  `app/vendor/vsanmgmtObjects.py` (198 methods; header: "Copyright 2020-2021 VMware, Inc.").
+  `docs/assets/vsan_api_methods.json` (198 methods; header: "Copyright 2020-2021 VMware, Inc.").
 * *Relation*: **direct** = the entity name or its schema text names the
   feature; *inference* = related by reasoning stated in the row, not by the
   sources.
@@ -3544,7 +3544,7 @@ provisional types copy the schema exactly):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-file-service` | direct | schema text: file-service IOPS / bytes / latency | HostSystem `cptvsan\|Services\|File Service` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | IOPS for read operations. |
+| `vsan-file-service` | direct | schema text: file-service IOPS / bytes / latency | HostSystem `cptvsan\|File Service` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | IOPS for read operations. |
 
 **Gap / risk**
 
@@ -3568,7 +3568,7 @@ provisional types copy the schema exactly):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-file-service` | *inference* | INFERENCE: RWX CNS volumes are served as file shares, so their IO would be inside this aggregate, unattributed | HostSystem `cptvsan\|Services\|File Service` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | IOPS for read operations. |
+| `vsan-file-service` | *inference* | INFERENCE: RWX CNS volumes are served as file shares, so their IO would be inside this aggregate, unattributed | HostSystem `cptvsan\|File Service` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | IOPS for read operations. |
 | `virtual-disk` | *inference* | INFERENCE: a block (RWO) persistent volume is a virtual disk attached to a node VM, so it would appear as that VM's disk | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
 
 **Gap / risk**
@@ -3590,13 +3590,13 @@ provisional types copy the schema exactly):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `cluster-remotedomclient` | direct | name / schema text: remote clients or remote datastore | ClusterComputeResource `cptvsan\|Storage I/O\|Remote DOM Client` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
-| `computeCluster-remotedomclient` | direct | name / schema text: remote clients or remote datastore | ClusterComputeResource `cptvsan\|Storage I/O\|Remote DOM Client (Compute)` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
-| `computeHost-remotedomclient` | direct | name / schema text: remote clients or remote datastore | HostSystem `cptvsan\|Storage I/O\|Remote DOM Client (Compute)` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
-| `host-remotedomclient` | direct | name / schema text: remote clients or remote datastore | HostSystem `cptvsan\|Storage I/O\|Remote DOM Client` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
-| `remote-virtual-disk` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|Virtual Disk (Remote):{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | yes | The applied IOPS limit on remote datastore. |
-| `remote-virtual-machine` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|VM (Remote)` | provisional | modelled, never observed (keys unverified) | 6 | 6 | yes | Virtual machine read IOPS on remote datastore. |
-| `remote-vscsi` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|vSCSI (Remote):{device}` | provisional | modelled, never observed (keys unverified) | 6 | 6 | yes | Virtual machine VSCSI read IOPS on remote datastore. |
+| `cluster-remotedomclient` | direct | name / schema text: remote clients or remote datastore | ClusterComputeResource `cptvsan\|Storage I/O:remote-dom-client` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
+| `computeCluster-remotedomclient` | direct | name / schema text: remote clients or remote datastore | ClusterComputeResource `cptvsan\|Storage I/O:remote-dom-client-compute` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
+| `computeHost-remotedomclient` | direct | name / schema text: remote clients or remote datastore | HostSystem `cptvsan\|Storage I/O:remote-dom-client-compute` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
+| `host-remotedomclient` | direct | name / schema text: remote clients or remote datastore | HostSystem `cptvsan\|Storage I/O:remote-dom-client` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
+| `remote-virtual-disk` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|Virtual Disk:remote-{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | yes | The applied IOPS limit on remote datastore. |
+| `remote-virtual-machine` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|VM:remote` | provisional | modelled, never observed (keys unverified) | 6 | 6 | yes | Virtual machine read IOPS on remote datastore. |
+| `remote-vscsi` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|vSCSI:remote-{device}` | provisional | modelled, never observed (keys unverified) | 6 | 6 | yes | Virtual machine VSCSI read IOPS on remote datastore. |
 
 **Gap / risk**
 
@@ -3620,10 +3620,10 @@ provisional types copy the schema exactly):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `cluster-remotedomclient` | *inference* | INFERENCE: a vSAN Max cluster serves remote clients, so it would be the "selected server cluster" in this text | ClusterComputeResource `cptvsan\|Storage I/O\|Remote DOM Client` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
-| `host-remotedomclient` | *inference* | INFERENCE: same mechanism, per client host | HostSystem `cptvsan\|Storage I/O\|Remote DOM Client` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
-| `computeCluster-remotedomclient` | *inference* | INFERENCE: the client side | ClusterComputeResource `cptvsan\|Storage I/O\|Remote DOM Client (Compute)` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
-| `computeHost-remotedomclient` | *inference* | INFERENCE: the client side, per host | HostSystem `cptvsan\|Storage I/O\|Remote DOM Client (Compute)` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
+| `cluster-remotedomclient` | *inference* | INFERENCE: a vSAN Max cluster serves remote clients, so it would be the "selected server cluster" in this text | ClusterComputeResource `cptvsan\|Storage I/O:remote-dom-client` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
+| `host-remotedomclient` | *inference* | INFERENCE: same mechanism, per client host | HostSystem `cptvsan\|Storage I/O:remote-dom-client` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
+| `computeCluster-remotedomclient` | *inference* | INFERENCE: the client side | ClusterComputeResource `cptvsan\|Storage I/O:remote-dom-client-compute` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
+| `computeHost-remotedomclient` | *inference* | INFERENCE: the client side, per host | HostSystem `cptvsan\|Storage I/O:remote-dom-client-compute` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
 
 **Gap / risk**
 
@@ -3646,8 +3646,8 @@ provisional types copy the schema exactly):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `cluster-rdt-network-latency` | *inference* | INFERENCE: inter-node RDT latency would include inter-site paths, but is aggregated per cluster | ClusterComputeResource `cptvsan\|Network\|RDT\|Cluster Latency` | live | observed (1 objects) | 15 | 17 | no | RDT network cluster average latency for last 5 seconds. |
-| `vnic-rdt-network-latency` | *inference* | INFERENCE: per vmknic, not per peer or site | HostSystem `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}` | live | observed (4 objects) | 1 | 17 | no | RDT network vnic average latency for last 5 seconds. |
+| `cluster-rdt-network-latency` | *inference* | INFERENCE: inter-node RDT latency would include inter-site paths, but is aggregated per cluster | ClusterComputeResource `cptvsan\|Network\|RDT` | live | observed (1 objects) | 15 | 17 | no | RDT network cluster average latency for last 5 seconds. |
+| `vnic-rdt-network-latency` | *inference* | INFERENCE: per vmknic, not per peer or site | HostSystem `cptvsan\|Network\|VMkernel NIC:{vmknic}` | live | observed (4 objects) | 1 | 17 | no | RDT network vnic average latency for last 5 seconds. |
 
 **Gap / risk**
 
@@ -3671,9 +3671,9 @@ provisional types copy the schema exactly):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-iscsi-host` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|Services\|iSCSI\|Host` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by all vSAN iSCSI targets on this ESXi host. |
-| `vsan-iscsi-lun` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by this vSAN iSCSI LUN. |
-| `vsan-iscsi-target` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|Services\|iSCSI\|Target:{target}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by all vSAN iSCSI LUNs on this target. |
+| `vsan-iscsi-host` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|iSCSI:host` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by all vSAN iSCSI targets on this ESXi host. |
+| `vsan-iscsi-lun` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|iSCSI:lun-{target}-{lun}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by this vSAN iSCSI LUN. |
+| `vsan-iscsi-target` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|iSCSI:target-{target}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by all vSAN iSCSI LUNs on this target. |
 
 **Gap / risk**
 
@@ -3727,6 +3727,7 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 * The only adapter wording in the sources is "HBA" in the device-latency description of vSAN's own disks. It names the HBA as a measurement point, not a transport; nothing names Fibre Channel, a WWN or a fabric.
 * `pfcCount` on `vsan-pnic-net` contains "fc" but is Priority Flow Control (label "PFC count"; HCIBench title "Flow Control (per-mille)"), not Fibre Channel.
 * INFERENCE: FC-attached datastores are not vSAN datastores, so their IO is outside the vSAN Performance Service by construction; vCenter's own datastore / HBA counters (VMWARE adapter) are where it would appear.
+* `cptvsan|Fibre Channel` is a RESERVED group name (`metric_tree.RESERVED`: no vSAN Performance Service entity type in the captured schema). Nothing is collected under it.
 
 **Open question -- where else the data might come from** (not asserted to exist): None for this pack: INFERENCE, FC is outside vSAN's data path. Recorded so the absence is not mistaken for a gap.
 
@@ -3742,12 +3743,12 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-direct-cluster` | direct | schema text: "vSAN Direct datastore" | HostSystem `cptvsan\|Services\|vSAN Direct Cluster` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
-| `vsan-direct-host` | direct | schema text: "vSAN Direct datastore" | HostSystem `cptvsan\|Services\|vSAN Direct` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
+| `vsan-direct-cluster` | direct | schema text: "vSAN Direct datastore" | HostSystem `cptvsan\|vSAN Direct:cluster` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
+| `vsan-direct-host` | direct | schema text: "vSAN Direct datastore" | HostSystem `cptvsan\|vSAN Direct:host` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
 
 **Gap / risk**
 
-* Never observed. `vsan-direct-cluster` has an inferred `host_uuid` identity and lands on the HOST as `Services|vSAN Direct Cluster` (section 9.1 item 9). If its real ref carries a cluster uuid, the host bucket will not resolve it and every object is unmapped.
+* Never observed. `vsan-direct-cluster` has an inferred `host_uuid` identity and lands on the HOST as `vSAN Direct:cluster` (section 9.1 item 9). If its real ref carries a cluster uuid, the host bucket will not resolve it and every object is unmapped.
 * Both types' schema descriptions are identical metric for metric (computed: True); only the name distinguishes scope.
 * No per-disk or per-datastore dimension: vSAN Direct uses whole devices as individual datastores (inference), which this aggregate cannot split.
 * `disk-group` `iopsDirectSched` ("Direct Scheduled IOPS") matches the word but concerns the OSA DOM scheduler, not vSAN Direct.
@@ -3766,8 +3767,8 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `cluster-pmem` | direct | schema text: "PMem datastore" | ClusterComputeResource `cptvsan\|Services\|PMEM` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read bandwidth consumed by all VM(s) on the PMem datastore. |
-| `host-pmem` | direct | schema text: "PMem datastore" | HostSystem `cptvsan\|Services\|PMEM` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read bandwidth consumed by all VM(s) on the PMem datastore of this host. |
+| `cluster-pmem` | direct | schema text: "PMem datastore" | ClusterComputeResource `cptvsan\|PMEM` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read bandwidth consumed by all VM(s) on the PMem datastore. |
+| `host-pmem` | direct | schema text: "PMem datastore" | HostSystem `cptvsan\|PMEM` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read bandwidth consumed by all VM(s) on the PMem datastore of this host. |
 
 **Gap / risk**
 
@@ -3791,12 +3792,13 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-direct-host` | *inference* | INFERENCE: Data Persistence platform services were commonly placed on vSAN Direct; IO would be an unattributed share here | HostSystem `cptvsan\|Services\|vSAN Direct` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
+| `vsan-direct-host` | *inference* | INFERENCE: Data Persistence platform services were commonly placed on vSAN Direct; IO would be an unattributed share here | HostSystem `cptvsan\|vSAN Direct:host` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
 
 **Gap / risk**
 
 * Nothing in the schema, the model or the vendored binding method names mentions S3, buckets or the Data Persistence platform. The HCIBench hits are "bucket" in allocator / PLOG dashboard titles (e.g. "Data Bucket Number Entries", "PLOG bucket data usage") -- unrelated to S3.
 * INFERENCE: such services run as workloads (VMs / pods), so their IO would appear, if anywhere, as VM, virtual-disk or vSAN Direct IO with no service attribution.
+* `cptvsan|Object Store` is a RESERVED group name (`metric_tree.RESERVED`: no vSAN Performance Service entity type (S3 / Data Persistence) in the captured schema). Nothing is collected under it.
 
 **Open question -- where else the data might come from** (not asserted to exist): Service-level metrics would come from the object-store partner service itself or from Kubernetes, not from vSAN -- not verified.
 
@@ -3812,7 +3814,7 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `ioinsight` | direct | name; schema text "... on the VMDK" | HostSystem `cptvsan\|Services\|IOInsight` | provisional | modelled, never observed (keys unverified) | 82 | 82 | yes | Read IO per second on the VMDK. |
+| `ioinsight` | direct | name; schema text "... on the VMDK" | HostSystem `cptvsan\|IOInsight` | provisional | modelled, never observed (keys unverified) | 82 | 82 | yes | Read IO per second on the VMDK. |
 
 **Gap / risk**
 
@@ -3836,15 +3838,15 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `cluster-domclient` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O\|DOM Client` | live | observed (1 objects) | 8 | 14 | no | Read IOPS consumed by all vSAN clients in the cluster, such as virtual machines, stats object, etc. |
-| `cluster-domcompmgr` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O\|DOM Component Manager` | live | observed (1 objects) | 14 | 15 | no | vSAN cluster read IOPS without resync traffic in the perspective of vSAN backend. |
-| `cluster-domowner` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O\|DOM Owner` | live | observed (1 objects) | 15 | 46 | no | Read latency of DOM owner. |
-| `host-domclient` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O\|DOM Client` | live | observed (4 objects) | 13 | 78 | no | Read IOPS consumed by all vSAN clients in the host, such as virtual machines, stats object, etc. |
-| `host-domcompmgr` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O\|DOM Component Manager` | live | observed (4 objects) | 20 | 82 | no | vSAN host read IOPS without resync traffic in the perspective of vSAN backend. |
-| `host-domowner` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O\|DOM Owner` | live | observed (4 objects) | 18 | 288 | no | Read latency of DOM owner. |
-| `cluster-zdom-top-stats` | direct | schema text: "vSAN ESA object backend" | ClusterComputeResource `cptvsan\|zDOM\|Top Stats` | live | observed (1 objects) | 6 | 12 | no | Cluster level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
-| `host-zdom-top-stats` | direct | schema text: "vSAN ESA object backend" | HostSystem `cptvsan\|zDOM\|Top Stats` | live | observed (4 objects) | 6 | 19 | no | Host level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
-| `vsan-distribution` | direct | schema text: components, DOM clients/owners per host | HostSystem `cptvsan\|Placement\|Distribution` | provisional | modelled, never observed (keys unverified) | 5 | 5 | no | Components. |
+| `cluster-domclient` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O:dom-client` | live | observed (1 objects) | 8 | 14 | no | Read IOPS consumed by all vSAN clients in the cluster, such as virtual machines, stats object, etc. |
+| `cluster-domcompmgr` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O:dom-compmgr` | live | observed (1 objects) | 14 | 15 | no | vSAN cluster read IOPS without resync traffic in the perspective of vSAN backend. |
+| `cluster-domowner` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O:dom-owner` | live | observed (1 objects) | 15 | 46 | no | Read latency of DOM owner. |
+| `host-domclient` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O:dom-client` | live | observed (4 objects) | 13 | 78 | no | Read IOPS consumed by all vSAN clients in the host, such as virtual machines, stats object, etc. |
+| `host-domcompmgr` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O:dom-compmgr` | live | observed (4 objects) | 20 | 82 | no | vSAN host read IOPS without resync traffic in the perspective of vSAN backend. |
+| `host-domowner` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O:dom-owner` | live | observed (4 objects) | 18 | 288 | no | Read latency of DOM owner. |
+| `cluster-zdom-top-stats` | direct | schema text: "vSAN ESA object backend" | ClusterComputeResource `cptvsan\|zDOM` | live | observed (1 objects) | 6 | 12 | no | Cluster level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
+| `host-zdom-top-stats` | direct | schema text: "vSAN ESA object backend" | HostSystem `cptvsan\|zDOM` | live | observed (4 objects) | 6 | 19 | no | Host level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
+| `vsan-distribution` | direct | schema text: components, DOM clients/owners per host | HostSystem `cptvsan\|Placement` | provisional | modelled, never observed (keys unverified) | 5 | 5 | no | Components. |
 | `virtual-disk` | *inference* | INFERENCE: nearest per-object granularity (one VMDK object) | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
 
 **Gap / risk**
@@ -4118,16 +4120,16 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
 | `vsan-cluster-capacity` | direct | schema text: savedByDedup, dedupRatio (space efficiency) | ClusterComputeResource `cptvsan\|Capacity` | live | observed (1 objects) | 5 | 6 | no | How much physical capacity saved by space efficiency feature. |
-| `cluster-esa-dedup-domclient-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|DOM Client I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Client. |
-| `cluster-esa-dedup-domcompmgr-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|DOM Component Manager I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Component Manager. |
-| `cluster-esa-dedup-domowner-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|DOM Owner I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Owner. |
-| `cluster-esa-dedup-store-chunksvc` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|Chunk Service` | provisional | modelled, never observed (keys unverified) | 27 | 27 | yes | Cluster level reported chunk objects from the perspective of IO entering the vSAN ESA global dedup chunk service. |
-| `cluster-esa-dedup-store-hashsvc` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|Hash Service` | provisional | modelled, never observed (keys unverified) | 34 | 34 | yes | Cluster level unique hash request count from the perspective of IO entering the vSAN ESA global dedup hash service. |
-| `host-esa-dedup-domclient-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|DOM Client I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Client. |
-| `host-esa-dedup-domcompmgr-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|DOM Component Manager I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Component Manager. |
-| `host-esa-dedup-domowner-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|DOM Owner I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Owner. |
-| `host-esa-dedup-store-chunksvc` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|Chunk Service` | provisional | modelled, never observed (keys unverified) | 27 | 27 | yes | Host level reported chunk objects from the perspective of IO entering the vSAN ESA global dedup chunk service. |
-| `host-esa-dedup-store-hashsvc` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|Hash Service` | provisional | modelled, never observed (keys unverified) | 34 | 34 | yes | Host level unique hash request count from the perspective of IO entering the vSAN ESA global dedup hash service. |
+| `cluster-esa-dedup-domclient-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup:dom-client-io` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Client. |
+| `cluster-esa-dedup-domcompmgr-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup:dom-compmgr-io` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Component Manager. |
+| `cluster-esa-dedup-domowner-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup:dom-owner-io` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Owner. |
+| `cluster-esa-dedup-store-chunksvc` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup:chunk-service` | provisional | modelled, never observed (keys unverified) | 27 | 27 | yes | Cluster level reported chunk objects from the perspective of IO entering the vSAN ESA global dedup chunk service. |
+| `cluster-esa-dedup-store-hashsvc` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup:hash-service` | provisional | modelled, never observed (keys unverified) | 34 | 34 | yes | Cluster level unique hash request count from the perspective of IO entering the vSAN ESA global dedup hash service. |
+| `host-esa-dedup-domclient-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup:dom-client-io` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Client. |
+| `host-esa-dedup-domcompmgr-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup:dom-compmgr-io` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Component Manager. |
+| `host-esa-dedup-domowner-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup:dom-owner-io` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Owner. |
+| `host-esa-dedup-store-chunksvc` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup:chunk-service` | provisional | modelled, never observed (keys unverified) | 27 | 27 | yes | Host level reported chunk objects from the perspective of IO entering the vSAN ESA global dedup chunk service. |
+| `host-esa-dedup-store-hashsvc` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup:hash-service` | provisional | modelled, never observed (keys unverified) | 34 | 34 | yes | Host level unique hash request count from the perspective of IO entering the vSAN ESA global dedup hash service. |
 
 **Gap / risk**
 
@@ -4150,8 +4152,8 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `host-vsansparse` | *inference* | schema text: "vSAN sparse" (INFERENCE: the vsanSparse snapshot format) | HostSystem `cptvsan\|Storage I/O\|vsanSparse` | live | observed (4 objects) | 12 | 21 | no | vSAN sparse host cache lookup latency. |
-| `vsan-dp-historical-stats` | direct | schema text: "Used By Snapshots" | ClusterComputeResource `cptvsan\|Services\|Data Protection` | live | observed (1 objects) | 1 | 1 | no | Used By Snapshots. |
+| `host-vsansparse` | *inference* | schema text: "vSAN sparse" (INFERENCE: the vsanSparse snapshot format) | HostSystem `cptvsan\|Storage I/O:vsansparse` | live | observed (4 objects) | 12 | 21 | no | vSAN sparse host cache lookup latency. |
+| `vsan-dp-historical-stats` | direct | schema text: "Used By Snapshots" | ClusterComputeResource `cptvsan\|Data Protection` | live | observed (1 objects) | 1 | 1 | no | Used By Snapshots. |
 
 Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
@@ -4202,7 +4204,7 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
 | `cluster-resync` | direct | schema text: resync by reason (policy, evacuation, rebalance, repair) | ClusterComputeResource `cptvsan\|Resync` | provisional | modelled, never observed (keys unverified) | 24 | 24 | no | Cluster resync policy change read IOPS. |
-| `disk-group` | direct | schema text: OSA disk-group resync by reason | HostSystem `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 38 | 38 | no | DOM component scheduler latency. |
+| `disk-group` | direct | schema text: OSA disk-group resync by reason | HostSystem `cptvsan\|Disk Group:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 38 | 38 | no | DOM component scheduler latency. |
 
 Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
@@ -4288,13 +4290,13 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 * schema text (entity name, metric id, name, description): `ddh-disk` (10)
 * model ids NOT advertised by the schema: no hits
 * HCIBench ids not in our model: 0
-* vendored vSAN Management API methods matching `Health`: `HostVsanHealthSystem.VsanHostCreateVmHealthTest`, `HostVsanHealthSystem.VsanHostQueryEncryptionHealthSummary`, `HostVsanHealthSystem.VsanHostQueryFileServiceHealthSummary`, `HostVsanHealthSystem.VsanHostQueryHealthSystemVersion`, `HostVsanHealthSystem.VsanHostQueryObjectHealthSummary`, `HostVsanHealthSystem.VsanHostQueryPhysicalDiskHealthSummary`, `HostVsanHealthSystem.VsanWaitForVsanHealthGenerationIdChange`, `VsanClusterHealthSystem.VsanQueryClusterCreateVmHealthTest`, `VsanClusterHealthSystem.VsanQueryClusterHealthSystemVersions`, `VsanClusterHealthSystem.VsanQueryClusterPhysicalDiskHealthSummary`, `VsanPerformanceManager.VsanPerfQueryClusterHealth`, `VsanPhoneHomeSystem.QueryVsanCloudHealthStatus`, `VsanPhoneHomeSystem.VsanPerformOnlineHealthCheck`, `VsanVcClusterHealthSystem.VsanClusterQueryFileServiceHealthSummary`, `VsanVcClusterHealthSystem.VsanHealthGetVsanClusterSilentChecks`, `VsanVcClusterHealthSystem.VsanHealthIsRebalanceRunning`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanClusterHealthCheckInterval`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanClusterHealthConfig`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanProxyConfig`, `VsanVcClusterHealthSystem.VsanHealthRepairClusterObjectsImmediate`, `VsanVcClusterHealthSystem.VsanHealthSendVsanTelemetry`, `VsanVcClusterHealthSystem.VsanHealthSetLogLevel`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterHealthCheckInterval`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterSilentChecks`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterTelemetryConfig`, `VsanVcClusterHealthSystem.VsanHealthTestVsanClusterTelemetryProxy`, `VsanVcClusterHealthSystem.VsanQueryAllSupportedHealthChecks`, `VsanVcClusterHealthSystem.VsanQueryVcClusterCreateVmHealthHistoryTest`, `VsanVcClusterHealthSystem.VsanQueryVcClusterCreateVmHealthTest`, `VsanVcClusterHealthSystem.VsanQueryVcClusterHealthSummary` (**used by the pack**), `VsanVcClusterHealthSystem.VsanQueryVcClusterHealthSummaryTask`, `VsanVcClusterHealthSystem.VsanVcClusterQueryVerifyHealthSystemVersions`
+* vendored vSAN Management API methods matching `Health`: `HostVsanHealthSystem.VsanHostCreateVmHealthTest`, `HostVsanHealthSystem.VsanHostQueryEncryptionHealthSummary`, `HostVsanHealthSystem.VsanHostQueryFileServiceHealthSummary`, `HostVsanHealthSystem.VsanHostQueryHealthSystemVersion`, `HostVsanHealthSystem.VsanHostQueryObjectHealthSummary`, `HostVsanHealthSystem.VsanHostQueryPhysicalDiskHealthSummary`, `HostVsanHealthSystem.VsanWaitForVsanHealthGenerationIdChange`, `VsanClusterHealthSystem.VsanQueryClusterCreateVmHealthTest`, `VsanClusterHealthSystem.VsanQueryClusterHealthSystemVersions`, `VsanClusterHealthSystem.VsanQueryClusterPhysicalDiskHealthSummary`, `VsanPerformanceManager.VsanPerfQueryClusterHealth`, `VsanPhoneHomeSystem.QueryVsanCloudHealthStatus`, `VsanPhoneHomeSystem.VsanPerformOnlineHealthCheck`, `VsanVcClusterHealthSystem.VsanClusterQueryFileServiceHealthSummary`, `VsanVcClusterHealthSystem.VsanHealthGetVsanClusterSilentChecks`, `VsanVcClusterHealthSystem.VsanHealthIsRebalanceRunning`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanClusterHealthCheckInterval`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanClusterHealthConfig`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanProxyConfig`, `VsanVcClusterHealthSystem.VsanHealthRepairClusterObjectsImmediate`, `VsanVcClusterHealthSystem.VsanHealthSendVsanTelemetry`, `VsanVcClusterHealthSystem.VsanHealthSetLogLevel`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterHealthCheckInterval`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterSilentChecks`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterTelemetryConfig`, `VsanVcClusterHealthSystem.VsanHealthTestVsanClusterTelemetryProxy`, `VsanVcClusterHealthSystem.VsanQueryAllSupportedHealthChecks`, `VsanVcClusterHealthSystem.VsanQueryVcClusterCreateVmHealthHistoryTest`, `VsanVcClusterHealthSystem.VsanQueryVcClusterCreateVmHealthTest`, `VsanVcClusterHealthSystem.VsanQueryVcClusterHealthSummary`, `VsanVcClusterHealthSystem.VsanQueryVcClusterHealthSummaryTask`, `VsanVcClusterHealthSystem.VsanVcClusterQueryVerifyHealthSystemVersions`
 
 **No Performance Service entity type in the captured schema covers this.**
 
 **Gap / risk**
 
-* The captured schema carries no health-check results. `ddh-disk` matches the term search only because its schema text says "vSAN DDH disk"; its metrics are IO, latency and log congestion. The pack's group name `Disks|Health` comes from `tools/build_model_extra.py` `label_for` expanding "ddh" to "Disk Health" -- an inference the schema never makes.
+* The captured schema carries no health-check results. `ddh-disk` matches the term search only because its schema text says "vSAN DDH disk"; its metrics are IO, latency and log congestion. The model label "vSAN Disk Health" comes from `tools/build_model_extra.py` `label_for` expanding "ddh" to "Disk Health" -- an inference the schema never makes. Its metrics now land in `Disk:<disk_uuid>` beside the other disk layers.
 * The pack DOES call the cluster health system (`VsanQueryVcClusterHealthSummary` with `fields=["hclInfo"]`) only to read controller driver versions for disk-hardware PROPERTIES.
 
 **Open question -- where else the data might come from** (not asserted to exist): The vendored bindings declare 32 methods whose names contain "Health" (listed above); which checks matter is a content decision.
@@ -4311,7 +4313,7 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `ddh-disk` | direct | name; schema text "vSAN DDH disk" (IO, latency, log congestion -- not SMART) | HostSystem `cptvsan\|Disks\|Health:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | no | vSAN DDH disk read IOPS. |
+| `ddh-disk` | direct | name; schema text "vSAN DDH disk" (IO, latency, log congestion -- not SMART) | HostSystem `cptvsan\|Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | no | vSAN DDH disk read IOPS. |
 
 **Gap / risk**
 
@@ -4332,9 +4334,9 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-esa-disk-scsifw` | direct | schema text: physical/firmware layer device latency | HostSystem `cptvsan\|Disks\|ESA Disk:{disk_uuid}` | live | observed (7 objects) | 8 | 16 | no | vSAN Express Storage Architecture disk physical/firmware layer Read IOPS. |
-| `cache-disk` | direct | OSA device latency | HostSystem `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 8 | 8 | no | vSAN disk physical/firmware layer read IOPS. |
-| `capacity-disk` | direct | OSA device latency | HostSystem `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 13 | 13 | no | vSAN disk physical/firmware layer read IOPS. |
+| `vsan-esa-disk-scsifw` | direct | schema text: physical/firmware layer device latency | HostSystem `cptvsan\|Disk:{disk_uuid}` | live | observed (7 objects) | 8 | 16 | no | vSAN Express Storage Architecture disk physical/firmware layer Read IOPS. |
+| `cache-disk` | direct | OSA device latency | HostSystem `cptvsan\|Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 8 | 8 | no | vSAN disk physical/firmware layer read IOPS. |
+| `capacity-disk` | direct | OSA device latency | HostSystem `cptvsan\|Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 13 | 13 | no | vSAN disk physical/firmware layer read IOPS. |
 
 Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
@@ -4399,7 +4401,7 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-dp-historical-stats` | direct | name; schema graph `dpcapacity` | ClusterComputeResource `cptvsan\|Services\|Data Protection` | live | observed (1 objects) | 1 | 1 | no | Used By Snapshots. |
+| `vsan-dp-historical-stats` | direct | name; schema graph `dpcapacity` | ClusterComputeResource `cptvsan\|Data Protection` | live | observed (1 objects) | 1 | 1 | no | Used By Snapshots. |
 
 Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
@@ -4460,11 +4462,11 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 | `vsan-vnic-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|VMkernel NIC:{vmknic}` | live | observed (4 objects) | 8 | 64 | no | VMkernel Network Adapter Throughput Inbound. |
 | `vsan-tcpip-stats` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|TCP/IP Stack:{stack}` | live | observed (4 objects) | 16 | 32 | no | VMkernel Network Adapter TCP outbound packets. |
 | `vsan-host-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|Host` | live | observed (4 objects) | 8 | 16 | no | Host Throughput Inbound of All VMkernel Network Adapters Enabled vSAN Traffic. |
-| `rdt-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|RDT\|Net` | live | observed (4 objects) | 1 | 1 | no | RDT net checksum mismatch count. |
-| `rdt-network-latency` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|RDT\|Host Latency` | live | observed (4 objects) | 1 | 17 | no | RDT network host average latency for last 5 seconds. |
-| `vnic-rdt-network-latency` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}` | live | observed (4 objects) | 1 | 17 | no | RDT network vnic average latency for last 5 seconds. |
-| `cluster-rdt-network-latency` | direct | name / schema text: network | ClusterComputeResource `cptvsan\|Network\|RDT\|Cluster Latency` | live | observed (1 objects) | 15 | 17 | no | RDT network cluster average latency for last 5 seconds. |
-| `cmmds-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|CMMDS` | live | observed (4 objects) | 10 | 10 | no | CMMDS network read inbound. |
+| `rdt-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|Host` | live | observed (4 objects) | 1 | 1 | no | RDT net checksum mismatch count. |
+| `rdt-network-latency` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|Host` | live | observed (4 objects) | 1 | 17 | no | RDT network host average latency for last 5 seconds. |
+| `vnic-rdt-network-latency` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|VMkernel NIC:{vmknic}` | live | observed (4 objects) | 1 | 17 | no | RDT network vnic average latency for last 5 seconds. |
+| `cluster-rdt-network-latency` | direct | name / schema text: network | ClusterComputeResource `cptvsan\|Network\|RDT` | live | observed (1 objects) | 15 | 17 | no | RDT network cluster average latency for last 5 seconds. |
+| `cmmds-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|Host` | live | observed (4 objects) | 10 | 10 | no | CMMDS network read inbound. |
 
 **Gap / risk**
 
@@ -4488,10 +4490,10 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `clom-host` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement\|CLOM` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Node component count ratio on this ESXi host. |
-| `clom-disk` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement\|CLOM Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | no | Disk component count ratio on this ESXi host. |
-| `cmmds-workload` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement\|CMMDS Workload` | provisional | modelled, never observed (keys unverified) | 23 | 23 | no | CMMDS workload inbound accept. |
-| `vsan-distribution` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement\|Distribution` | provisional | modelled, never observed (keys unverified) | 5 | 5 | no | Components. |
+| `clom-host` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Node component count ratio on this ESXi host. |
+| `clom-disk` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | no | Disk component count ratio on this ESXi host. |
+| `cmmds-workload` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement` | provisional | modelled, never observed (keys unverified) | 23 | 23 | no | CMMDS workload inbound accept. |
+| `vsan-distribution` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement` | provisional | modelled, never observed (keys unverified) | 5 | 5 | no | Components. |
 
 **Gap / risk**
 
@@ -4512,14 +4514,14 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU\|vSAN` | live | observed (4 objects) | 3 | 7 | no | Percentage of used CPU time |
-| `host-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU\|Core:{cpu}` | live | observed (244 objects) | 3 | 3 | no | Percentage of CPU core uitilization. |
-| `dom-world-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU\|DOM World:{world_name}-{world_id}` | live | observed (315 objects) | 2 | 3 | no | Percentage of used CPU time |
-| `lsom-world-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU\|LSOM World:{world_name}-{world_id}` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Percentage of used CPU time |
-| `vsan-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory\|vSAN` | live | observed (4 objects) | 2 | 50 | no | Kernel Reserved Memory Size. |
-| `system-mem` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory\|System` | live | observed (4 objects) | 3 | 3 | no | System total memory used. |
-| `heap-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory\|Heap:{heap_name}` | provisional | modelled, never observed (keys unverified) | 1 | 1 | no | Heap utilization. |
-| `slab-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory\|Slab:{slab_name}` | provisional | modelled, never observed (keys unverified) | 1 | 1 | no | Slab utilization. |
+| `vsan-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU:vsan` | live | observed (4 objects) | 3 | 7 | no | Percentage of used CPU time |
+| `host-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU:core-{cpu}` | live | observed (244 objects) | 3 | 3 | no | Percentage of CPU core uitilization. |
+| `dom-world-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU:dom-{world_name}-{world_id}` | live | observed (315 objects) | 2 | 3 | no | Percentage of used CPU time |
+| `lsom-world-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU:lsom-{world_name}-{world_id}` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Percentage of used CPU time |
+| `vsan-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory:vsan` | live | observed (4 objects) | 2 | 50 | no | Kernel Reserved Memory Size. |
+| `system-mem` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory:system` | live | observed (4 objects) | 3 | 3 | no | System total memory used. |
+| `heap-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory:heap-{heap_name}` | provisional | modelled, never observed (keys unverified) | 1 | 1 | no | Heap utilization. |
+| `slab-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory:slab-{slab_name}` | provisional | modelled, never observed (keys unverified) | 1 | 1 | no | Slab utilization. |
 
 **Gap / risk**
 
@@ -4538,9 +4540,9 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `cluster-zdom-top-stats` | direct | name: zDOM | ClusterComputeResource `cptvsan\|zDOM\|Top Stats` | live | observed (1 objects) | 6 | 12 | no | Cluster level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
-| `host-zdom-top-stats` | direct | name: zDOM | HostSystem `cptvsan\|zDOM\|Top Stats` | live | observed (4 objects) | 6 | 19 | no | Host level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
-| `zdom-vtx` | direct | name: zDOM | HostSystem `cptvsan\|zDOM\|VTX` | live | observed (4 objects) | 2 | 71 | no | Cache miss per IOPS. |
+| `cluster-zdom-top-stats` | direct | name: zDOM | ClusterComputeResource `cptvsan\|zDOM` | live | observed (1 objects) | 6 | 12 | no | Cluster level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
+| `host-zdom-top-stats` | direct | name: zDOM | HostSystem `cptvsan\|zDOM` | live | observed (4 objects) | 6 | 19 | no | Host level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
+| `zdom-vtx` | direct | name: zDOM | HostSystem `cptvsan\|zDOM` | live | observed (4 objects) | 2 | 71 | no | Cache miss per IOPS. |
 
 **Gap / risk**
 
@@ -4561,11 +4563,11 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `vsan-esa-disk-layer` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|ESA Disk:{disk_uuid}` | live | observed (7 objects) | 6 | 38 | no | vSAN layer read IOPS of vSAN Express Storage Architecture disk. |
-| `vsan-esa-disk-scsifw` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|ESA Disk:{disk_uuid}` | live | observed (7 objects) | 8 | 16 | no | vSAN Express Storage Architecture disk physical/firmware layer Read IOPS. |
-| `disk-group` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 38 | 38 | no | DOM component scheduler latency. |
-| `cache-disk` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 8 | 8 | no | vSAN disk physical/firmware layer read IOPS. |
-| `capacity-disk` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 13 | 13 | no | vSAN disk physical/firmware layer read IOPS. |
+| `vsan-esa-disk-layer` | direct | name: disk layer | HostSystem `cptvsan\|Disk:{disk_uuid}` | live | observed (7 objects) | 6 | 38 | no | vSAN layer read IOPS of vSAN Express Storage Architecture disk. |
+| `vsan-esa-disk-scsifw` | direct | name: disk layer | HostSystem `cptvsan\|Disk:{disk_uuid}` | live | observed (7 objects) | 8 | 16 | no | vSAN Express Storage Architecture disk physical/firmware layer Read IOPS. |
+| `disk-group` | direct | name: disk layer | HostSystem `cptvsan\|Disk Group:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 38 | 38 | no | DOM component scheduler latency. |
+| `cache-disk` | direct | name: disk layer | HostSystem `cptvsan\|Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 8 | 8 | no | vSAN disk physical/firmware layer read IOPS. |
+| `capacity-disk` | direct | name: disk layer | HostSystem `cptvsan\|Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 13 | 13 | no | vSAN disk physical/firmware layer read IOPS. |
 
 **Gap / risk**
 
@@ -4584,7 +4586,7 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `virtual-machine` | direct | name: VM level | VirtualMachine `cptvsan\|VM` | live | observed (30 objects) | 6 | 8 | no | Virtual machine read IOPS. |
+| `virtual-machine` | direct | name: VM level | VirtualMachine `cptvsan\|VM:local` | live | observed (30 objects) | 6 | 8 | no | Virtual machine read IOPS. |
 | `virtual-disk` | direct | name: VM level | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
 | `vscsi` | direct | name: VM level | VirtualMachine `cptvsan\|vSCSI:{device}` | live | observed (106 objects) | 6 | 8 | no | Virtual machine VSCSI read IOPS. |
 
@@ -4604,7 +4606,7 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 * schema text (entity name, metric id, name, description): `cluster-domclient` (8), `host-domclient` (11)
 * model ids NOT advertised by the schema: no hits
 * HCIBench ids not in our model: 0
-* vendored vSAN Management API methods matching `^VsanPerf[A-Z]`: `VsanFileServiceSystem.VsanPerformFileServiceEnablePreflightCheck`, `VsanPerformanceManager.VsanPerfCreateStatsObject`, `VsanPerformanceManager.VsanPerfCreateStatsObjectTask`, `VsanPerformanceManager.VsanPerfDeleteStatsObject`, `VsanPerformanceManager.VsanPerfDeleteStatsObjectTask`, `VsanPerformanceManager.VsanPerfDeleteTimeRange`, `VsanPerformanceManager.VsanPerfDiagnose`, `VsanPerformanceManager.VsanPerfDiagnoseTask`, `VsanPerformanceManager.VsanPerfGetAggregatedEntityTypes`, `VsanPerformanceManager.VsanPerfGetSupportedDiagnosticExceptions`, `VsanPerformanceManager.VsanPerfGetSupportedEntityTypes`, `VsanPerformanceManager.VsanPerfQueryClusterHealth`, `VsanPerformanceManager.VsanPerfQueryNodeInformation` (**used by the pack**), `VsanPerformanceManager.VsanPerfQueryPerf` (**used by the pack**), `VsanPerformanceManager.VsanPerfQueryStatsObjectInformation`, `VsanPerformanceManager.VsanPerfQueryTimeRanges`, `VsanPerformanceManager.VsanPerfSaveTimeRanges`, `VsanPerformanceManager.VsanPerfSetStatsObjectPolicy`, `VsanPerformanceManager.VsanPerfToggleVerboseMode`, `VsanPhoneHomeSystem.VsanPerformOnlineHealthCheck`, `VsanResourceCheckSystem.VsanPerformResourceCheck`
+* vendored vSAN Management API methods matching `^VsanPerf[A-Z]`: `VsanFileServiceSystem.VsanPerformFileServiceEnablePreflightCheck`, `VsanPerformanceManager.VsanPerfCreateStatsObject`, `VsanPerformanceManager.VsanPerfCreateStatsObjectTask`, `VsanPerformanceManager.VsanPerfDeleteStatsObject`, `VsanPerformanceManager.VsanPerfDeleteStatsObjectTask`, `VsanPerformanceManager.VsanPerfDeleteTimeRange`, `VsanPerformanceManager.VsanPerfDiagnose`, `VsanPerformanceManager.VsanPerfDiagnoseTask`, `VsanPerformanceManager.VsanPerfGetAggregatedEntityTypes`, `VsanPerformanceManager.VsanPerfGetSupportedDiagnosticExceptions`, `VsanPerformanceManager.VsanPerfGetSupportedEntityTypes`, `VsanPerformanceManager.VsanPerfQueryClusterHealth`, `VsanPerformanceManager.VsanPerfQueryNodeInformation`, `VsanPerformanceManager.VsanPerfQueryPerf`, `VsanPerformanceManager.VsanPerfQueryStatsObjectInformation`, `VsanPerformanceManager.VsanPerfQueryTimeRanges`, `VsanPerformanceManager.VsanPerfSaveTimeRanges`, `VsanPerformanceManager.VsanPerfSetStatsObjectPolicy`, `VsanPerformanceManager.VsanPerfToggleVerboseMode`, `VsanPhoneHomeSystem.VsanPerformOnlineHealthCheck`, `VsanResourceCheckSystem.VsanPerformResourceCheck`
 
 **No Performance Service entity type in the captured schema covers this.**
 
@@ -4644,8 +4646,8 @@ Metric-level coverage inside broader entity types (`Actual` twins excluded):
 
 | Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
 |---|---|---|---|---|---|---|---|---|---|
-| `clom-host` | direct | schema text: node component count ratio | HostSystem `cptvsan\|Placement\|CLOM` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Node component count ratio on this ESXi host. |
-| `clom-disk` | direct | schema text: disk component count ratio | HostSystem `cptvsan\|Placement\|CLOM Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | no | Disk component count ratio on this ESXi host. |
+| `clom-host` | direct | schema text: node component count ratio | HostSystem `cptvsan\|Placement` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Node component count ratio on this ESXi host. |
+| `clom-disk` | direct | schema text: disk component count ratio | HostSystem `cptvsan\|Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | no | Disk component count ratio on this ESXi host. |
 
 **Gap / risk**
 
