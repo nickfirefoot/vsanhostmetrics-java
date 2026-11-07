@@ -37,6 +37,7 @@ proof, this document says so rather than filling the gap.
 8. [Collection scope and cost](#8-collection-scope-and-cost)
 9. [Known gaps, conflicts and open questions](#9-known-gaps-conflicts-and-open-questions)
 10. [How to propose a change](#10-how-to-propose-a-change)
+11. [Coverage gaps by vSAN feature](#11-coverage-gaps-by-vsan-feature)
 
 ## 1. Purpose and the 2.0.0 design
 
@@ -3454,3 +3455,1283 @@ Each item is phrased as a question; suggestions are the point of this document.
   the one measurement that proves it (e.g. "every HostSystem in cluster X has
   `cptvsan|Network|Physical NIC:<vmnic>|rxMissErr` for each vSAN uplink,
   and `cptvsan|Collector|lastUpdated` advanced this cycle").
+## 11. Coverage gaps by vSAN feature
+
+For each vSAN feature an operator might expect to monitor, this section states
+which Performance Service entity types relate to it, whether we model them,
+whether they were ever observed returning data, and what is missing. It is
+written to be argued with.
+
+**Method and vocabulary.**
+
+* *Related entity types* are chosen by hand, from a term search over four
+  sources, all printed per area so the choice can be checked:
+  the schema `docs/assets/perfsvc_schema.json` (captured from
+  `VsanPerfGetSupportedEntityTypes`; entity name, metric id, name,
+  description), our model `app/perfsvc_model*.py` (metric ids returned but not
+  advertised), the HCIBench vocabulary `docs/assets/hcibench_units.json`
+  (metric ids its Grafana dashboards chart -- the ENTITY TYPE behind those ids
+  is not recorded, so a hit there says only that some source emits such an id),
+  and the method names of the vendored vSAN Management API bindings
+  `app/vendor/vsanmgmtObjects.py` (198 methods; header: "Copyright 2020-2021 VMware, Inc.").
+* *Relation*: **direct** = the entity name or its schema text names the
+  feature; *inference* = related by reasoning stated in the row, not by the
+  sources.
+* *Status*: "observed (n objects)" = `ENTITIES[...]['objects_observed'] > 0`
+  in the live model; "modelled, never observed (keys unverified)" =
+  `objects_observed == 0`: the type is queried and keyed from the schema, but
+  its identity, metric set and keys have never been checked against data.
+* Where no entity type relates directly, the subsection says exactly "No Performance Service entity type in the captured schema covers this."
+  That is a statement about this captured schema (one cluster, one version),
+  **not** a claim that vSAN lacks the capability.
+* A vendored method name is evidence that the binding declares it, nothing
+  more: whether the target vCenter serves it, and what it returns, is not
+  verified anywhere in this repository. INFERENCE: the bindings
+  predate ESA-era features, so the absence of a name there is weak evidence.
+* "Open question" lines name where data MIGHT come from. None is asserted to
+  exist.
+
+### 11.0 Schema vs model, computed
+
+Entity types present in the schema but NOT in our model (0):
+
+_None: every one of the 69 schema entity types is modelled and has a TREE row._
+
+Schema metrics not in our model: 0. The reverse is
+large -- the service returns more than it advertises. Types whose modelled
+metric set exceeds the schema (26; all are live-model types, because
+provisional types copy the schema exactly):
+
+| Entity type | Status | Schema metrics | Modelled metrics | Model-only |
+|---|---|---|---|---|
+| `cluster-domclient` | observed (1 objects) | 8 | 14 | 6 |
+| `cluster-domcompmgr` | observed (1 objects) | 14 | 15 | 1 |
+| `cluster-domowner` | observed (1 objects) | 15 | 46 | 31 |
+| `cluster-rdt-network-latency` | observed (1 objects) | 15 | 17 | 2 |
+| `cluster-zdom-top-stats` | observed (1 objects) | 6 | 12 | 6 |
+| `dom-world-cpu` | observed (315 objects) | 2 | 3 | 1 |
+| `host-domclient` | observed (4 objects) | 13 | 78 | 65 |
+| `host-domcompmgr` | observed (4 objects) | 20 | 82 | 62 |
+| `host-domowner` | observed (4 objects) | 18 | 288 | 270 |
+| `host-vsansparse` | observed (4 objects) | 12 | 21 | 9 |
+| `host-zdom-top-stats` | observed (4 objects) | 6 | 19 | 13 |
+| `rdt-network-latency` | observed (4 objects) | 1 | 17 | 16 |
+| `virtual-disk` | observed (60 objects) | 3 | 7 | 4 |
+| `virtual-machine` | observed (30 objects) | 6 | 8 | 2 |
+| `vnic-rdt-network-latency` | observed (4 objects) | 1 | 17 | 16 |
+| `vsan-cluster-capacity` | observed (1 objects) | 5 | 6 | 1 |
+| `vsan-cpu` | observed (4 objects) | 3 | 7 | 4 |
+| `vsan-esa-disk-layer` | observed (7 objects) | 6 | 38 | 32 |
+| `vsan-esa-disk-scsifw` | observed (7 objects) | 8 | 16 | 8 |
+| `vsan-host-net` | observed (4 objects) | 8 | 16 | 8 |
+| `vsan-memory` | observed (4 objects) | 2 | 50 | 48 |
+| `vsan-pnic-net` | observed (7 objects) | 16 | 65 | 49 |
+| `vsan-tcpip-stats` | observed (4 objects) | 16 | 32 | 16 |
+| `vsan-vnic-net` | observed (4 objects) | 8 | 64 | 56 |
+| `vscsi` | observed (106 objects) | 6 | 8 | 2 |
+| `zdom-vtx` | observed (4 objects) | 2 | 71 | 69 |
+
+**Group A -- Data services and access protocols**
+
+### 11.1 vSAN File Services (NFS / SMB file shares)
+
+*Term search* `\bfile|\bnfs\b|\bsmb\b|\bshares?\b|protocol` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `vsan-file-service` (8)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `File|FsDomain|Fsvm`: `HostVsanHealthSystem.VsanHostQueryFileServiceHealthSummary`, `VsanFileServiceSystem.VsanClusterCreateFsDomain`, `VsanFileServiceSystem.VsanClusterQueryFileShares`, `VsanFileServiceSystem.VsanClusterQueryFsDomains`, `VsanFileServiceSystem.VsanClusterReconfigureFsDomain`, `VsanFileServiceSystem.VsanClusterRemoveFsDomain`, `VsanFileServiceSystem.VsanCreateFileShare`, `VsanFileServiceSystem.VsanDownloadFileServiceOvf`, `VsanFileServiceSystem.VsanPerformFileServiceEnablePreflightCheck`, `VsanFileServiceSystem.VsanQueryFileServiceOvfs`, `VsanFileServiceSystem.VsanReconfigureFileShare`, `VsanFileServiceSystem.VsanUpgradeFsvm`, `VsanVcClusterHealthSystem.VsanClusterQueryFileServiceHealthSummary`, `VsanVcClusterHealthSystem.VsanDownloadHclFile_Task`, `VsanVcClusterHealthSystem.VsanPurgeHclFiles`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-file-service` | direct | schema text: file-service IOPS / bytes / latency | HostSystem `cptvsan\|Services\|File Service` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | IOPS for read operations. |
+
+**Gap / risk**
+
+* Eight aggregate metrics only (read/write ops, requested vs transferred bytes, latency). The schema text never mentions NFS, SMB, a share, a protocol or a client (computed: 0 of its metrics' name/description/graph text match nfs, smb, share, protocol or client), so per-share, per-protocol and per-file-server breakdowns are absent from the captured schema.
+* Identity is INFERRED as `host_uuid` (the fallback rule in `tools/build_model_extra.py`), and the TREE row has no instance. If the service returns more than one object per host (e.g. per file server or per share -- unknown), they share one key on the HostSystem: `push.plan` counts a collision and the last object written wins.
+* QUICKSTART.md lists file services as "present in the schema, never enabled".
+
+**Open question -- where else the data might come from** (not asserted to exist): Per-share and file-service health: the vendored bindings declare `VsanClusterQueryFileShares`, `VsanClusterQueryFileServiceHealthSummary` and `VsanHostQueryFileServiceHealthSummary` (listed above). Whether they return per-share usage or performance is not established here.
+
+
+### 11.2 RWX volumes (ReadWriteMany: CNS file volumes on vSAN File Services) and CNS / Kubernetes persistent volumes
+
+*Term search* `\bcns\b|kubernetes|\bk8s\b|\bpvc?\b|\brwx\b|readwritemany|\bvolume` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `^Cns`: `CnsVolumeManager.CnsAttachVolume`, `CnsVolumeManager.CnsCreateVolume`, `CnsVolumeManager.CnsDeleteVolume`, `CnsVolumeManager.CnsDetachVolume`, `CnsVolumeManager.CnsQueryVolume`, `CnsVolumeManager.CnsUpdateVolumeMetadata`
+
+**No Performance Service entity type in the captured schema covers this.**
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-file-service` | *inference* | INFERENCE: RWX CNS volumes are served as file shares, so their IO would be inside this aggregate, unattributed | HostSystem `cptvsan\|Services\|File Service` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | IOPS for read operations. |
+| `virtual-disk` | *inference* | INFERENCE: a block (RWO) persistent volume is a virtual disk attached to a node VM, so it would appear as that VM's disk | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
+
+**Gap / risk**
+
+* Nothing in the schema, the model or the HCIBench vocabulary names CNS, Kubernetes, a PV/PVC or a volume (term search above).
+* Under the inference above, PV IO is visible only as node-VM virtual-disk or file-service aggregates. Nothing joins a disk path or a share to a PV/PVC/namespace.
+
+**Open question -- where else the data might come from** (not asserted to exist): The vendored bindings declare a `CnsVolumeManager` with `CnsQueryVolume`; whether its result carries the backing disk/share identity needed to join PVs to the metrics above is not established here.
+
+
+### 11.3 HCI Mesh / remote datastores / compute-only clusters (client and server side)
+
+*Term search* `remote|compute(cluster|host)|server cluster|\bmesh\b` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-remotedomclient` (8), `computeCluster-remotedomclient` (8), `computeHost-remotedomclient` (11), `host-remotedomclient` (11), `remote-virtual-disk` (3), `remote-virtual-machine` (6), `remote-vscsi` (6)
+* model ids NOT advertised by the schema: `host-domowner`: `readLeafOwnerLatencyRemote`, `writeLeafOwnerLatencyRemote`, `resyncReadLeafOwnerLatencyRemote`, `recoveryWriteLeafOwnerLatencyRemote`
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Remote|Mesh|Datastore(Source|Share)`: none
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-remotedomclient` | direct | name / schema text: remote clients or remote datastore | ClusterComputeResource `cptvsan\|Storage I/O\|Remote DOM Client` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
+| `computeCluster-remotedomclient` | direct | name / schema text: remote clients or remote datastore | ClusterComputeResource `cptvsan\|Storage I/O\|Remote DOM Client (Compute)` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
+| `computeHost-remotedomclient` | direct | name / schema text: remote clients or remote datastore | HostSystem `cptvsan\|Storage I/O\|Remote DOM Client (Compute)` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
+| `host-remotedomclient` | direct | name / schema text: remote clients or remote datastore | HostSystem `cptvsan\|Storage I/O\|Remote DOM Client` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
+| `remote-virtual-disk` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|Virtual Disk (Remote):{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | yes | The applied IOPS limit on remote datastore. |
+| `remote-virtual-machine` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|VM (Remote)` | provisional | modelled, never observed (keys unverified) | 6 | 6 | yes | Virtual machine read IOPS on remote datastore. |
+| `remote-vscsi` | direct | name / schema text: remote clients or remote datastore | VirtualMachine `cptvsan\|vSCSI (Remote):{device}` | provisional | modelled, never observed (keys unverified) | 6 | 6 | yes | Virtual machine VSCSI read IOPS on remote datastore. |
+
+**Gap / risk**
+
+* Every remote type is provisional and never observed; identity is inferred. Section 4.4 records the attribution assumptions in full: which side's `cluster_uuid` the `*-remotedomclient` refs carry, whether a compute-only cluster/host resolves at all, cross-vCenter refs dropped as unmapped, possible double collection across clusters, and whether local `virtual-machine` already includes remote IO.
+* `cluster-remotedomclient` and `computeCluster-remotedomclient` have IDENTICAL schema descriptions for every metric (computed: True); the schema text alone cannot distinguish their perspective.
+* `remote-virtual-disk` resolves through the virtual-disk PATH map while its inferred part is named `disk_uuid`: if the ref carries a uuid, every object is unmapped.
+
+**Open question -- where else the data might come from** (not asserted to exist): Which mount relationships exist (client cluster -> server datastore) is configuration, not performance; no vendored method name matches the search above. A vCenter datastore listing may show remote vSAN datastores mounted on client hosts -- not verified.
+
+
+### 11.4 vSAN Max / disaggregated storage clusters
+
+*Term search* `vsan max|disaggregat|storage cluster|server cluster|compute.?only|client cluster` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-remotedomclient` (8), `computeCluster-remotedomclient` (8), `computeHost-remotedomclient` (11), `host-remotedomclient` (11)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Max|Disaggregat|StorageCluster`: none
+
+**No Performance Service entity type in the captured schema covers this.**
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-remotedomclient` | *inference* | INFERENCE: a vSAN Max cluster serves remote clients, so it would be the "selected server cluster" in this text | ClusterComputeResource `cptvsan\|Storage I/O\|Remote DOM Client` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
+| `host-remotedomclient` | *inference* | INFERENCE: same mechanism, per client host | HostSystem `cptvsan\|Storage I/O\|Remote DOM Client` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
+| `computeCluster-remotedomclient` | *inference* | INFERENCE: the client side | ClusterComputeResource `cptvsan\|Storage I/O\|Remote DOM Client (Compute)` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all remote vSAN clients against the selected server cluster, such as virtual machines, etc. |
+| `computeHost-remotedomclient` | *inference* | INFERENCE: the client side, per host | HostSystem `cptvsan\|Storage I/O\|Remote DOM Client (Compute)` | provisional | modelled, never observed (keys unverified) | 11 | 11 | yes | Read IOPS consumed by hosts in remote vSAN clients against the selected server cluster. |
+
+**Gap / risk**
+
+* No schema type or metric text names vSAN Max or disaggregation. The only matches are the "server cluster" wording of the remote types, so everything in the HCI Mesh subsection applies, with the same unverified attribution.
+* INFERENCE: a storage-only cluster has no local VMs, so its `VM` / `Virtual Disk` groups would stay empty and its useful data would be the server-side `*-remotedomclient`, DOM owner/compmgr, disk and network families.
+
+**Open question -- where else the data might come from** (not asserted to exist): Whether vSAN Max advertises additional entity types is unknown: this schema was captured from one non-Max cluster (inference from QUICKSTART's test scope).
+
+
+### 11.5 Stretched clusters and the witness host
+
+*Term search* `witness|stretch|\bsites?\b|fault.?domain|preferred|secondary|inter.?site` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Witness|Stretched|FaultDomain`: `VimClusterVsanVcStretchedClusterSystem.VSANIsWitnessVirtualAppliance`, `VimClusterVsanVcStretchedClusterSystem.VSANVcAddWitnessHost`, `VimClusterVsanVcStretchedClusterSystem.VSANVcConvertToStretchedCluster`, `VimClusterVsanVcStretchedClusterSystem.VSANVcGetPreferredFaultDomain`, `VimClusterVsanVcStretchedClusterSystem.VSANVcGetWitnessHosts`, `VimClusterVsanVcStretchedClusterSystem.VSANVcIsWitnessHost`, `VimClusterVsanVcStretchedClusterSystem.VSANVcRemoveWitnessHost`, `VimClusterVsanVcStretchedClusterSystem.VSANVcRetrieveStretchedClusterVcCapability`, `VimClusterVsanVcStretchedClusterSystem.VSANVcSetPreferredFaultDomain`
+
+**No Performance Service entity type in the captured schema covers this.**
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-rdt-network-latency` | *inference* | INFERENCE: inter-node RDT latency would include inter-site paths, but is aggregated per cluster | ClusterComputeResource `cptvsan\|Network\|RDT\|Cluster Latency` | live | observed (1 objects) | 15 | 17 | no | RDT network cluster average latency for last 5 seconds. |
+| `vnic-rdt-network-latency` | *inference* | INFERENCE: per vmknic, not per peer or site | HostSystem `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}` | live | observed (4 objects) | 1 | 17 | no | RDT network vnic average latency for last 5 seconds. |
+
+**Gap / risk**
+
+* **Contradiction in our own sources:** the docstring of `tools/build_model_extra.py` says "OSA disk groups, ESA dedup, file services, iSCSI, stretched cluster, PMem and vSAN Direct all appear here"; the term search finds no schema type or metric text naming a stretched cluster, site, witness or fault domain.
+* No identity part in the model is a site or fault domain, so site-level aggregation (preferred vs secondary) cannot be expressed in the current tree; RDT latency is per cluster / host / vmknic, never per peer.
+* A witness host's data, if the service returns any, would be attributed by vSAN node uuid like any host; whether a witness appliance resolves to a HostSystem in the same vCenter bucket is unverified.
+* `docs/assets/dashboard.broadcom-vsan-esa.json` (a third-party dashboard kept as reference) reads `Configuration|vSAN|stretchedCluster`, a property on another adapter's objects -- not this pack's data.
+* QUICKSTART.md lists stretched clusters as untested.
+
+**Open question -- where else the data might come from** (not asserted to exist): Topology and witness identity: the vendored bindings declare the stretched-cluster methods listed above. Inter-site latency per peer is not found in any source here.
+
+
+### 11.6 iSCSI target service
+
+*Term search* `iscsi|\btarget\b|\blun\b|initiator` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `vsan-iscsi-host` (10), `vsan-iscsi-lun` (10), `vsan-iscsi-target` (10)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 2 -- `freeingRate`, `targetRate`
+* vendored vSAN Management API methods matching `Iscsi`: `VsanIscsiTargetSystem.VsanVitAddIscsiInitiatorGroup`, `VsanIscsiTargetSystem.VsanVitAddIscsiInitiatorsToGroup`, `VsanIscsiTargetSystem.VsanVitAddIscsiInitiatorsToTarget`, `VsanIscsiTargetSystem.VsanVitAddIscsiLUN`, `VsanIscsiTargetSystem.VsanVitAddIscsiTarget`, `VsanIscsiTargetSystem.VsanVitAddIscsiTargetToGroup`, `VsanIscsiTargetSystem.VsanVitEditIscsiLUN`, `VsanIscsiTargetSystem.VsanVitEditIscsiTarget`, `VsanIscsiTargetSystem.VsanVitGetIscsiInitiatorGroup`, `VsanIscsiTargetSystem.VsanVitGetIscsiInitiatorGroups`, `VsanIscsiTargetSystem.VsanVitGetIscsiLUN`, `VsanIscsiTargetSystem.VsanVitGetIscsiLUNs`, `VsanIscsiTargetSystem.VsanVitGetIscsiTarget`, `VsanIscsiTargetSystem.VsanVitGetIscsiTargets`, `VsanIscsiTargetSystem.VsanVitQueryIscsiTargetServiceVersion`, `VsanIscsiTargetSystem.VsanVitRemoveIscsiInitiatorGroup`, `VsanIscsiTargetSystem.VsanVitRemoveIscsiInitiatorsFromGroup`, `VsanIscsiTargetSystem.VsanVitRemoveIscsiInitiatorsFromTarget`, `VsanIscsiTargetSystem.VsanVitRemoveIscsiLUN`, `VsanIscsiTargetSystem.VsanVitRemoveIscsiTarget`, `VsanIscsiTargetSystem.VsanVitRemoveIscsiTargetFromGroup`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-iscsi-host` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|Services\|iSCSI\|Host` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by all vSAN iSCSI targets on this ESXi host. |
+| `vsan-iscsi-lun` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|Services\|iSCSI\|LUN:{target}-{lun}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by this vSAN iSCSI LUN. |
+| `vsan-iscsi-target` | direct | name / schema text: vSAN iSCSI | HostSystem `cptvsan\|Services\|iSCSI\|Target:{target}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | yes | Read IOPS consumed by all vSAN iSCSI LUNs on this target. |
+
+**Gap / risk**
+
+* Never observed; identity inferred (`host_uuid|target[|lun]`), and the `target` / `lun` placeholders are illustrative (section 3).
+* `sanitize_instance` replaces `:` with `-`, so IQNs lose their colons in instance names (section 9.1 item 3).
+* Targets and LUNs land on the HOST named in the ref. INFERENCE: if target ownership moves between hosts, the series moves with it and history is split across HostSystems.
+* No initiator / session dimension in the schema text.
+
+**Open question -- where else the data might come from** (not asserted to exist): Target/LUN inventory and initiator groups: `VsanVitGetIscsiTargets`, `VsanVitGetIscsiLUNs`, `VsanVitGetIscsiInitiatorGroups` in the vendored bindings (not used by the pack).
+
+
+### 11.7 NVMe-oF / NVMe-TCP
+
+*Term search* `nvme|\bnvmf\b|\bnqn\b|subsystem` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Nvme`: none
+
+**No Performance Service entity type in the captured schema covers this.**
+
+**Gap / risk**
+
+* NVMe appears in this repository only as local device model strings in test fixtures (`test_perfsvc.py`), i.e. the transport of a vSAN disk, not a fabric service. Nothing names an NVMe-oF target, subsystem or NQN.
+
+**Open question -- where else the data might come from** (not asserted to exist): If vSAN exposes an NVMe-oF/TCP service on the target version, its statistics may come from another vSAN Management API or ESXi; none is named in the vendored bindings.
+
+
+### 11.8 Fibre Channel
+
+*Term search* `fibre|fiber|\bfc\b|\bhba\b|\bwwn|\bwwpn` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cache-disk` (1), `capacity-disk` (1), `vsan-esa-disk-scsifw` (1)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Fibre|Fiber|\bFc|Hba`: none
+
+**No Performance Service entity type in the captured schema covers this.** Related metrics exist inside broader entity types (metric-level table below).
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `cache-disk` | modelled, never observed (keys unverified) | 1 | 1 | 0 | `latencyDevDAvg` | schema text: "device latency (from HBA to backend storage)" -- vSAN's own disks |
+| `capacity-disk` | modelled, never observed (keys unverified) | 1 | 1 | 0 | `latencyDevDAvg` | schema text: "device latency (from HBA to backend storage)" -- vSAN's own disks |
+| `vsan-esa-disk-scsifw` | observed (7 objects) | 1 | 1 | 0 | `latencyDevDAvg` | schema text: "device latency (from HBA to backend storage)" -- vSAN's own disks |
+
+**Gap / risk**
+
+* The only adapter wording in the sources is "HBA" in the device-latency description of vSAN's own disks. It names the HBA as a measurement point, not a transport; nothing names Fibre Channel, a WWN or a fabric.
+* `pfcCount` on `vsan-pnic-net` contains "fc" but is Priority Flow Control (label "PFC count"; HCIBench title "Flow Control (per-mille)"), not Fibre Channel.
+* INFERENCE: FC-attached datastores are not vSAN datastores, so their IO is outside the vSAN Performance Service by construction; vCenter's own datastore / HBA counters (VMWARE adapter) are where it would appear.
+
+**Open question -- where else the data might come from** (not asserted to exist): None for this pack: INFERENCE, FC is outside vSAN's data path. Recorded so the absence is not mistaken for a gap.
+
+
+### 11.9 vSAN Direct
+
+*Term search* `vsan direct|\bdirect\b` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `disk-group` (1), `vsan-direct-cluster` (8), `vsan-direct-host` (8)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Direct`: none
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-direct-cluster` | direct | schema text: "vSAN Direct datastore" | HostSystem `cptvsan\|Services\|vSAN Direct Cluster` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
+| `vsan-direct-host` | direct | schema text: "vSAN Direct datastore" | HostSystem `cptvsan\|Services\|vSAN Direct` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
+
+**Gap / risk**
+
+* Never observed. `vsan-direct-cluster` has an inferred `host_uuid` identity and lands on the HOST as `Services|vSAN Direct Cluster` (section 9.1 item 9). If its real ref carries a cluster uuid, the host bucket will not resolve it and every object is unmapped.
+* Both types' schema descriptions are identical metric for metric (computed: True); only the name distinguishes scope.
+* No per-disk or per-datastore dimension: vSAN Direct uses whole devices as individual datastores (inference), which this aggregate cannot split.
+* `disk-group` `iopsDirectSched` ("Direct Scheduled IOPS") matches the word but concerns the OSA DOM scheduler, not vSAN Direct.
+
+**Open question -- where else the data might come from** (not asserted to exist): Per-device vSAN Direct datastores might be visible as ordinary VMFS datastores in vCenter -- not verified.
+
+
+### 11.10 PMEM (persistent memory datastores)
+
+*Term search* `pmem|persistent memory` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-pmem` (8), `host-pmem` (8)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Pmem`: none
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-pmem` | direct | schema text: "PMem datastore" | ClusterComputeResource `cptvsan\|Services\|PMEM` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read bandwidth consumed by all VM(s) on the PMem datastore. |
+| `host-pmem` | direct | schema text: "PMem datastore" | HostSystem `cptvsan\|Services\|PMEM` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read bandwidth consumed by all VM(s) on the PMem datastore of this host. |
+
+**Gap / risk**
+
+* Never observed.
+* **Unit risk (computed):** the schema graphs PMEM latency as `time_ns`, but units in this pack are global per metric id and `latencyRead` is `TIME.MICROSECONDS` (it is shared with other families). If the schema's graph unit is right for PMEM, the label is 1000x off. The schema unit is not authoritative (section 6.1), so this is open, not adjudicated.
+* PMEM `bandwidth*` is graphed as `number` while our unit for `bandwidthRead` is `DATA_RATE.BIBYTE_PER_SECOND` (shared with iSCSI, whose schema unit is `rate_bytes`).
+
+**Open question -- where else the data might come from** (not asserted to exist): Whether PMEM is still a supported datastore type on the target version is not recorded here.
+
+
+### 11.11 Object storage service (S3-compatible / vSAN Data Persistence platform)
+
+*Term search* `\bs3\b|bucket|object store|object service|persistence|\bdpp\b` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 39 -- `avgGoodnessHigh`, `avgGoodnessHighest`, `avgGoodnessLow`, `avgGoodnessLowest`, `avgGoodnessMid`, `b0Data`, `b1Data`, `b2Data`, `b3Data`, `b4Data`, ... (+29 more)
+* vendored vSAN Management API methods matching `S3|Bucket|Persistence|Dpp|Vdpp`: none
+
+**No Performance Service entity type in the captured schema covers this.**
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-direct-host` | *inference* | INFERENCE: Data Persistence platform services were commonly placed on vSAN Direct; IO would be an unattributed share here | HostSystem `cptvsan\|Services\|vSAN Direct` | provisional | modelled, never observed (keys unverified) | 8 | 8 | yes | Read IOPS consumed by all VMDK(s) on the vSAN Direct datastore. |
+
+**Gap / risk**
+
+* Nothing in the schema, the model or the vendored binding method names mentions S3, buckets or the Data Persistence platform. The HCIBench hits are "bucket" in allocator / PLOG dashboard titles (e.g. "Data Bucket Number Entries", "PLOG bucket data usage") -- unrelated to S3.
+* INFERENCE: such services run as workloads (VMs / pods), so their IO would appear, if anywhere, as VM, virtual-disk or vSAN Direct IO with no service attribution.
+
+**Open question -- where else the data might come from** (not asserted to exist): Service-level metrics would come from the object-store partner service itself or from Kubernetes, not from vSAN -- not verified.
+
+
+### 11.12 IOInsight
+
+*Term search* `ioinsight|on the vmdk` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `ioinsight` (82)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `IoInsight|IOInsight`: none
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `ioinsight` | direct | name; schema text "... on the VMDK" | HostSystem `cptvsan\|Services\|IOInsight` | provisional | modelled, never observed (keys unverified) | 82 | 82 | yes | Read IO per second on the VMDK. |
+
+**Gap / risk**
+
+* Never observed. The schema text says every metric is per VMDK, but the identity is INFERRED as `host_uuid` (fallback rule) and the TREE row has no instance. If the service returns one object per VMDK under a host uuid, all of a host's VMDKs collide on one key (counted as collisions, last wins); if the first part is not a host uuid, every object is unmapped. Either way the per-VMDK value is lost. This is the clearest placement defect in the inferred model.
+* 74 of its 82 metrics are schema-`permille`; 0 of those are converted by `perfsvc.PERMILLE` (section 6.4).
+* IOInsight runs only while an IOInsight instance is active (inference), so it is correctly feature-gated in `FEATURE_ENTITIES`.
+
+**Open question -- where else the data might come from** (not asserted to exist): Should IOInsight land on the VirtualMachine with a `{vdisk}` instance, like `virtual-disk`? Needs one observed ref.
+
+
+**Group B -- Objects, disks and space**
+
+### 11.13 vSAN objects (storage sense: DOM objects and components)
+
+*Term search* `\bobjects?\b|\bcomponents?\b|\bdom\b` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `clom-disk` (3), `clom-host` (2), `cluster-domclient` (8), `cluster-domcompmgr` (3), `cluster-domowner` (15), `cluster-esa-dedup-domclient-io` (24), `cluster-esa-dedup-domcompmgr-io` (24), `cluster-esa-dedup-domowner-io` (24), `cluster-esa-dedup-store-chunksvc` (4), `cluster-esa-dedup-store-hashsvc` (1), `cluster-zdom-top-stats` (6), `disk-group` (34), `dom-world-cpu` (2), `host-domclient` (11), `host-domcompmgr` (3), `host-domowner` (18), `host-esa-dedup-domclient-io` (24), `host-esa-dedup-domcompmgr-io` (24), `host-esa-dedup-domowner-io` (24), `host-esa-dedup-store-chunksvc` (4), `host-esa-dedup-store-hashsvc` (1), `host-zdom-top-stats` (6), `vsan-distribution` (5)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 14 -- `commitFlusherComponentsToFlush`, `ctFlushAvgTime`, `ctFlushMaxTime`, `ctFlushMinTime`, `ctNumActiveComp`, `ctNumDeletedComp`, `ctNumFailedReserves`, `ctNumFreeComp`, `ctNumPagesFlushed`, `ctNumReservedComp`, ... (+4 more)
+* vendored vSAN Management API methods matching `Object`: `HostVsanHealthSystem.VsanHostQueryObjectHealthSummary`, `HostVsanHealthSystem.VsanHostRepairImmediateObjects`, `VsanClusterHealthSystem.VsanRepairClusterImmediateObjects`, `VsanIscsiTargetSystem.VsanVitGetHomeObject`, `VsanObjectSystem.QuerySyncingVsanObjectsSummary`, `VsanObjectSystem.VosQueryVsanObjectInformation`, `VsanObjectSystem.VosSetVsanObjectPolicy`, `VsanObjectSystem.VsanDeleteObjects_Task`, `VsanObjectSystem.VsanQueryInaccessibleVmSwapObjects`, `VsanObjectSystem.VsanQueryObjectIdentities`, `VsanPerformanceManager.VsanPerfCreateStatsObject`, `VsanPerformanceManager.VsanPerfCreateStatsObjectTask`, `VsanPerformanceManager.VsanPerfDeleteStatsObject`, `VsanPerformanceManager.VsanPerfDeleteStatsObjectTask`, `VsanPerformanceManager.VsanPerfQueryStatsObjectInformation`, `VsanPerformanceManager.VsanPerfSetStatsObjectPolicy`, `VsanSystemEx.VsanQuerySyncingVsanObjects`, `VsanVcClusterHealthSystem.VsanHealthRepairClusterObjectsImmediate`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-domclient` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O\|DOM Client` | live | observed (1 objects) | 8 | 14 | no | Read IOPS consumed by all vSAN clients in the cluster, such as virtual machines, stats object, etc. |
+| `cluster-domcompmgr` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O\|DOM Component Manager` | live | observed (1 objects) | 14 | 15 | no | vSAN cluster read IOPS without resync traffic in the perspective of vSAN backend. |
+| `cluster-domowner` | direct | DOM layer: object IO aggregated per cluster | ClusterComputeResource `cptvsan\|Storage I/O\|DOM Owner` | live | observed (1 objects) | 15 | 46 | no | Read latency of DOM owner. |
+| `host-domclient` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O\|DOM Client` | live | observed (4 objects) | 13 | 78 | no | Read IOPS consumed by all vSAN clients in the host, such as virtual machines, stats object, etc. |
+| `host-domcompmgr` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O\|DOM Component Manager` | live | observed (4 objects) | 20 | 82 | no | vSAN host read IOPS without resync traffic in the perspective of vSAN backend. |
+| `host-domowner` | direct | DOM layer: object IO aggregated per host | HostSystem `cptvsan\|Storage I/O\|DOM Owner` | live | observed (4 objects) | 18 | 288 | no | Read latency of DOM owner. |
+| `cluster-zdom-top-stats` | direct | schema text: "vSAN ESA object backend" | ClusterComputeResource `cptvsan\|zDOM\|Top Stats` | live | observed (1 objects) | 6 | 12 | no | Cluster level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
+| `host-zdom-top-stats` | direct | schema text: "vSAN ESA object backend" | HostSystem `cptvsan\|zDOM\|Top Stats` | live | observed (4 objects) | 6 | 19 | no | Host level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
+| `vsan-distribution` | direct | schema text: components, DOM clients/owners per host | HostSystem `cptvsan\|Placement\|Distribution` | provisional | modelled, never observed (keys unverified) | 5 | 5 | no | Components. |
+| `virtual-disk` | *inference* | INFERENCE: nearest per-object granularity (one VMDK object) | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
+
+**Gap / risk**
+
+* No entity type is keyed by a DOM object uuid (computed set of identity parts: `cluster_uuid`, `cpu`, `device`, `disk_uuid`, `heap_name`, `host_uuid`, `lun`, `slab_name`, `stack`, `target`, `vdisk_uuid`, `vm_uuid`, `vmknic`, `vmnic`, `world_id`, `world_name`; `vdisk_uuid` is a datastore PATH). Object IO is therefore only available as per-host / per-cluster DOM aggregates.
+* `vsan-distribution` (component counts) is never observed.
+
+**Open question -- where else the data might come from** (not asserted to exist): Per-object state: `VosQueryVsanObjectInformation`, `VsanQueryObjectIdentities`, `VsanQuerySyncingVsanObjects` in the vendored bindings.
+
+
+### 11.14 Object health and durability components
+
+*Term search* `durab|absent|degraded|\bhealth|inaccessib|reduced.?redundancy` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 6 -- `iopsDurableLog`, `latencyAvgDurableLog`, `latencyAvgDurableLogListWait`, `latencyMaxDurableLog`, `latencyStddevDurableLog`, `tputDurableLog`
+* vendored vSAN Management API methods matching `ObjectHealth|ObjExtAttrs|RepairClusterObjects|RepairImmediate|ObjectsImmediate`: `HostVsanHealthSystem.VsanHostQueryObjectHealthSummary`, `HostVsanHealthSystem.VsanHostRepairImmediateObjects`, `VsanVcClusterHealthSystem.VsanHealthRepairClusterObjectsImmediate`, `VsanVcClusterHealthSystem.VsanQueryVcClusterObjExtAttrs`
+
+**No Performance Service entity type in the captured schema covers this.** Related metrics exist inside broader entity types (metric-level table below).
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `host-domcompmgr` | observed (4 objects) | 5 | 3 | 2 | `recWriteCount`, `recWriteCongestion`, `iopsRecUnmap`, `throughputRecUnmap`, `latencyAvgRecUnmap` | recovery-write IO (inference: writes that restore redundancy) |
+| `host-domowner` | observed (4 objects) | 10 | 1 | 9 | `recoveryWriteCongestion`, `recWriteCount`, `iopsRecUnmap`, `tputRecUnmap`, `latencyAvgRecUnmap`, `recoveryUnmapCongestion`, `recoveryWriteLeafOwnerLatency`, `recoveryUnmapLeafOwnerLatency`, ... (+2 more) | recovery-write IO (inference: writes that restore redundancy) |
+
+**Gap / risk**
+
+* The schema advertises no object-health state (healthy / reduced redundancy / inaccessible) and no durability-component metric. The HCIBench vocabulary charts `iopsDurableLog`, `latencyAvgDurableLog` and similar (see hits) which no modelled type returns; which entity type would return them is not recorded.
+* Recovery-write metrics exist in the observed DOM families (table above) and are the nearest performance proxy.
+
+**Open question -- where else the data might come from** (not asserted to exist): Object health summary: `VsanHostQueryObjectHealthSummary` and the cluster health summary (the pack already calls `VsanQueryVcClusterHealthSummary`, but only for disk-hardware properties).
+
+
+### 11.15 Abandoned / orphaned / inaccessible objects
+
+*Term search* `orphan|abandon|inaccessib|unassociat` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Inaccessible|Orphan|Unassociated|DeleteObjects`: `VsanObjectSystem.VsanDeleteObjects_Task`, `VsanObjectSystem.VsanQueryInaccessibleVmSwapObjects`
+
+**No Performance Service entity type in the captured schema covers this.**
+
+**Gap / risk**
+
+* Nothing in the schema, model or HCIBench vocabulary names orphaned, unassociated or inaccessible objects.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanQueryInaccessibleVmSwapObjects` and `VsanQueryObjectIdentities` are declared in the vendored bindings; whether the latter can identify unassociated objects is not established here.
+
+
+### 11.16 VM swap objects and VM home namespace objects
+
+*Term search* `swap|namespace|vmhome` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: `host-domcompmgr`: `namespaceQueueDepthRead`, `namespaceQueueDepthWrite`, `namespaceDispatchedCostRead`, `namespaceDispatchedCostWrite`
+* HCIBench ids not in our model: 8 -- `namespaceBackpressureCongestionReadSched`, `namespaceBackpressureCongestionWriteSched`, `namespaceDispatchedCostReadSched`, `namespaceDispatchedCostWriteSched`, `namespaceQueueDepthReadSched`, `namespaceQueueDepthWriteSched`, `namespaceThroughputReadSched`, `namespaceThroughputWriteSched`
+* vendored vSAN Management API methods matching `Swap|Namespace`: `VsanObjectSystem.VsanQueryInaccessibleVmSwapObjects`
+
+**No Performance Service entity type in the captured schema covers this.** Related metrics exist inside broader entity types (metric-level table below).
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `host-domcompmgr` | observed (4 objects) | 12 | 0 | 12 | `metadataQueueDepthRead`, `metadataQueueDepthWrite`, `namespaceQueueDepthRead`, `namespaceQueueDepthWrite`, `vmdiskQueueDepthRead`, `vmdiskQueueDepthWrite`, `metadataDispatchedCostRead`, `metadataDispatchedCostWrite`, ... (+4 more) | DOM component-manager scheduler queues per object CLASS (namespace vs vmdisk vs metadata) |
+
+**Gap / risk**
+
+* No entity type is scoped to a swap or namespace object. The observed `host-domcompmgr` exposes scheduler queue depth and dispatched cost split by class (namespace / vmdisk / metadata) -- per host, not per object or VM. These ids are not in the advertised schema (model-only).
+* HCIBench charts further `namespace*Sched` ids (see hits) that no modelled type returns.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanQueryInaccessibleVmSwapObjects` (vendored) for swap-object accessibility; per-VM namespace capacity via `VsanQueryEntitySpaceUsage` (vendored) -- neither verified.
+
+
+### 11.17 First Class Disks (FCD / Improved Virtual Disks)
+
+*Term search* `\bfcd\b|first.?class|improved virtual|\bivd\b` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Fcd|FirstClass|Vstorage`: none
+
+**No Performance Service entity type in the captured schema covers this.**
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `virtual-disk` | *inference* | INFERENCE: an attached FCD is a virtual disk of a VM | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
+| `vscsi` | *inference* | INFERENCE: an attached FCD has a vSCSI device | VirtualMachine `cptvsan\|vSCSI:{device}` | live | observed (106 objects) | 6 | 8 | no | Virtual machine VSCSI read IOPS. |
+
+**Gap / risk**
+
+* Nothing names FCD/IVD. An UNATTACHED FCD has no VM, so even if the service reported it, `virtual-disk` resolution (disk path -> owning VM) would leave it unmapped and dropped (inference from the vdisk bucket in section 4.1).
+
+**Open question -- where else the data might come from** (not asserted to exist): FCD inventory is a vCenter (VStorageObjectManager) concept, not vSAN; not named in the vendored vSAN bindings.
+
+
+### 11.18 Independent disks (persistent / nonpersistent)
+
+*Term search* `independent|nonpersistent|\bpersistent\b` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Independent`: none
+
+**No Performance Service entity type in the captured schema covers this.**
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `virtual-disk` | *inference* | INFERENCE: an independent disk is still a VM virtual disk | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
+
+**Gap / risk**
+
+* Nothing distinguishes disk mode. INFERENCE: a nonpersistent disk writes to a redo log whose path differs from the base disk; if the service keys that IO by the redo path, the path map (built from `backing.fileName`) may not resolve it.
+
+**Open question -- where else the data might come from** (not asserted to exist): Disk mode is a vCenter VM-configuration property (VMWARE adapter).
+
+
+### 11.19 Multi-writer disks
+
+*Term search* `multi.?writer|sharing` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `MultiWriter`: none
+
+**No Performance Service entity type in the captured schema covers this.**
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `virtual-disk` | *inference* | INFERENCE: one disk path, several VMs | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
+
+**Gap / risk**
+
+* Nothing names multi-writer. The vdisk bucket maps a disk PATH to a VM; `build_parent_map` assigns `out["vdisks"][path] = vm._moId` per VM, so with one path attached to several VMs the VM iterated last wins and all of that disk's IO lands on it (read from the code; not observed).
+
+**Open question -- where else the data might come from** (not asserted to exist): Sharing mode is a vCenter VM-configuration property.
+
+
+### 11.20 Storage policy (SPBM) compliance and per-policy capacity
+
+*Term search* `polic|compliance|spbm` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-domcompmgr` (3), `cluster-domowner` (2), `cluster-resync` (6), `disk-group` (6), `host-domcompmgr` (3), `host-domowner` (2), `remote-virtual-disk` (2), `virtual-disk` (2)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 7 -- `bePolicyAllocator`, `complianceSuccessCount`, `curBytesToSyncPolicy`, `fixComplianceQueuedBytes`, `fixComplianceQueuedObjects`, `readCountPolicy`, `recWriteCountPolicy`
+* vendored vSAN Management API methods matching `Polic|Compliance|SpaceUsage`: `VsanObjectSystem.VosSetVsanObjectPolicy`, `VsanPerformanceManager.VsanPerfSetStatsObjectPolicy`, `VsanSpaceReportSystem.VsanQueryEntitySpaceUsage`, `VsanSpaceReportSystem.VsanQuerySpaceUsage`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-resync` | direct | schema text: resync due to "policy change" | ClusterComputeResource `cptvsan\|Resync` | provisional | modelled, never observed (keys unverified) | 24 | 24 | no | Cluster resync policy change read IOPS. |
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `cluster-resync` | modelled, never observed (keys unverified) | 6 | 6 | 0 | `iopsResyncReadPolicy`, `iopsResyncWritePolicy`, `latResyncReadPolicy`, `latResyncWritePolicy`, `tputResyncReadPolicy`, `tputResyncWritePolicy` | resync IO caused by policy change |
+| `disk-group` | modelled, never observed (keys unverified) | 6 | 6 | 0 | `iopsResyncReadPolicy`, `iopsResyncWritePolicy`, `latResyncReadPolicy`, `latResyncWritePolicy`, `tputResyncReadPolicy`, `tputResyncWritePolicy` | resync IO caused by policy change |
+| `remote-virtual-disk` | modelled, never observed (keys unverified) | 1 | 1 | 0 | `iopsLimit` | schema text: "applied IOPS limit" (a policy rule) |
+| `virtual-disk` | observed (60 objects) | 1 | 1 | 0 | `iopsLimit` | schema text: "applied IOPS limit" (a policy rule) |
+
+**Gap / risk**
+
+* Policy appears only as a resync REASON and as the applied IOPS limit. No compliance state and no per-policy capacity in the schema.
+* `cluster-resync` (the policy-change breakdown) is never observed even on the live cluster; whether it is silent because nothing resynced or because it is unsupported on that architecture is not established.
+* HCIBench charts `complianceSuccessCount`, `fixComplianceQueued*` (see hits), from an unrecorded entity type.
+
+**Open question -- where else the data might come from** (not asserted to exist): Per-policy / per-object capacity: `VsanQuerySpaceUsage`, `VsanQueryEntitySpaceUsage`; policy set: `VosSetVsanObjectPolicy` (vendored).
+
+
+### 11.21 ESA adaptive RAID-5/6 and erasure coding
+
+*Term search* `raid|erasure|parity|\bmirror|\bstripe` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Raid|Erasure`: none
+
+**No Performance Service entity type in the captured schema covers this.** Related metrics exist inside broader entity types (metric-level table below).
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `host-domowner` | observed (4 objects) | 10 | 0 | 10 | `readECLeafOwnerMaxLatencyAvgUs`, `writeECLeafOwnerMaxLatencyAvgUs`, `unmapECLeafOwnerMaxLatencyAvgUs`, `ownerECCacheNumCachedObjects`, `ownerECCacheHitMissRatio`, `ownerECCacheNumFailedAllocs`, `ownerECCacheNumSuccessAllocs`, `readECLeafOwnerMaxLatencyUs`, ... (+2 more) | "EC" in the id (inference: erasure coding) |
+
+**Gap / risk**
+
+* No schema text names RAID, erasure coding or parity. The only hints are model-only DOM-owner ids containing `EC` (table above), whose meaning is inferred from the abbreviation only.
+* No metric reports which RAID layout an object or cluster uses, nor adaptive RAID-5 transitions.
+
+**Open question -- where else the data might come from** (not asserted to exist): Layout is per object (`VosQueryVsanObjectInformation`, vendored) -- not verified to expose it.
+
+
+### 11.22 Thin provisioning and capacity reservations (operations reserve, host rebuild reserve)
+
+*Term search* `\bthin|reserv|provision|slack|rebuild reserve|operations reserve` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-esa-dedup-store-chunksvc` (3), `host-esa-dedup-store-chunksvc` (3), `vsan-memory` (2)
+* model ids NOT advertised by the schema: `host-domowner`: `twoPCReservedLSNUsedCount`, `twoPCReservedLSNUnusedCount`, `twoPCReservedLSNExhaustedCount`; `vsan-memory`: `vsanmgmtdReservedSize`, `vsanmgmtdWatchdogReservedSize`, `clomdReservedSize`, `osfsdReservedSize`, `cmmdsdReservedSize`, `vitdReservedSize`, ... (+5 more)
+* HCIBench ids not in our model: 9 -- `avgReserveBlockTime`, `blksReservedTput`, `ctNumFailedReserves`, `ctNumReservedComp`, `maxReserveBlockTime`, `minReserveBlockTime`, `physDiskCapacityReserved`, `reserveBlockApiTput`, `thinPlacementSuccessCount`
+* vendored vSAN Management API methods matching `SpaceUsage|Capacity|Reserv`: `VimClusterVsanVcDiskManagementSystem.QueryClusterDataEfficiencyCapacityState`, `VsanSpaceReportSystem.VsanQueryEntitySpaceUsage`, `VsanSpaceReportSystem.VsanQuerySpaceUsage`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-cluster-capacity` | direct | schema text: total / free / used capacity | ClusterComputeResource `cptvsan\|Capacity` | live | observed (1 objects) | 5 | 6 | no | How much physical capacity saved by space efficiency feature. |
+
+**Gap / risk**
+
+* Capacity is total / free / used / savedByDedup (+ model-only `totalDpOverhead`). No reserved, provisioned or slack figure is advertised. Schema hits for "reserv" are vSAN daemon MEMORY reservations (`vsan-memory`) and dedup chunk text -- not capacity.
+* HCIBench charts `physDiskCapacityReserved` and `thinPlacementSuccessCount` from an unrecorded entity type.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanQuerySpaceUsage` (vendored) is the likely source of reserve breakdowns -- not verified.
+
+
+### 11.23 TRIM / UNMAP and space reclamation
+
+*Term search* `unmap|\btrim\b|reclaim` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `computeHost-remotedomclient` (3), `ddh-disk` (3), `host-domclient` (3), `host-domcompmgr` (6), `host-domowner` (1), `host-remotedomclient` (3)
+* model ids NOT advertised by the schema: `cluster-domclient`: `unmapCongestion`; `cluster-domowner`: `unmapCongestion`; `cluster-zdom-top-stats`: `iopsUnmap`, `throughputUnmap`, `latencyAvgUnmap`; `host-domclient`: `unmapCount`, `unmapCongestion`, `latencyMaxUnmap`, `latencyStddevUnmap`, `iopsSegCleanerUnmap`, `segCleanerUnmapLeafOwnerLatency`, ... (+6 more); `host-domcompmgr`: `unmapCount`, `recUnmapCount`, `unmapCongestion`, `recUnmapCongestion`, `latencyMaxUnmap`, `latencyStddevUnmap`; `host-domowner`: `iopsUnmap`, `tputUnmap`, `latencyAvgUnmap`, `unmapCount`, `iopsRecUnmap`, `tputRecUnmap`, ... (+18 more); `host-zdom-top-stats`: `iopsUnmap`, `throughputUnmap`, `latencyAvgUnmap`, `unmapCount`, `unmapLatencyMaxUs`; `vsan-esa-disk-layer`: `iopsUnmapPerf`, `tputUnmapPerf`, `avgLatUnmapPerf`, `maxUnmapTimePerf`, `minUnmapTimePerf`, `iopsUnmapCapacity`, ... (+6 more); `vsan-esa-disk-scsifw`: `iopsDevUnmap`, `throughputDevUnmap`, `latencyDevUnmap`, `ioCountDevUnmap`; `zdom-vtx`: `rateTxnUnmapTotalCacheMiss`, `rateTxnUnmapLogicalTreeCacheMiss`, `rateTxnUnmapMiddleTreeCacheMiss`, `rateTxnUnmapSutCacheMiss`, `latAvgTxnUnmap`, `latAvgTxnUnmapTotalIO`, ... (+1 more)
+* HCIBench ids not in our model: 39 -- `avgLatUnmap`, `avgUnmapTput`, `bankWriteRate`, `iopsRecoveryUnmapCompMgr`, `iopsUnmapCompMgr`, `latAvgUnmapDispatchTime`, `latencyRecoveryUnmapCompMgr`, `latencyUnmapCompMgr`, `maxUnmapTime`, `minUnmapTime`, ... (+29 more)
+* vendored vSAN Management API methods matching `Unmap|Reclaim`: none
+
+**No Performance Service entity type in the captured schema covers this.** Related metrics exist inside broader entity types (metric-level table below).
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `cluster-domclient` | observed (1 objects) | 1 | 0 | 1 | `unmapCongestion` | UNMAP IO |
+| `cluster-domowner` | observed (1 objects) | 1 | 0 | 1 | `unmapCongestion` | UNMAP IO |
+| `cluster-zdom-top-stats` | observed (1 objects) | 3 | 0 | 3 | `iopsUnmap`, `throughputUnmap`, `latencyAvgUnmap` | UNMAP IO |
+| `computeHost-remotedomclient` | modelled, never observed (keys unverified) | 3 | 3 | 0 | `iopsUnmap`, `latencyAvgUnmap`, `throughputUnmap` | UNMAP IO |
+| `ddh-disk` | modelled, never observed (keys unverified) | 3 | 3 | 0 | `avgUnmapIOPS`, `avgUnmapLatency`, `avgUnmapTPut` | UNMAP IO |
+| `host-domclient` | observed (4 objects) | 15 | 3 | 12 | `iopsUnmap`, `throughputUnmap`, `latencyAvgUnmap`, `unmapCount`, `unmapCongestion`, `latencyMaxUnmap`, `latencyStddevUnmap`, `iopsSegCleanerUnmap`, ... (+7 more) | UNMAP IO |
+| `host-domcompmgr` | observed (4 objects) | 12 | 6 | 6 | `iopsUnmap`, `throughputUnmap`, `latencyAvgUnmap`, `unmapCount`, `iopsRecUnmap`, `throughputRecUnmap`, `latencyAvgRecUnmap`, `recUnmapCount`, ... (+4 more) | UNMAP IO |
+| `host-domowner` | observed (4 objects) | 25 | 1 | 24 | `iopsUnmap`, `tputUnmap`, `latencyAvgUnmap`, `unmapCount`, `iopsRecUnmap`, `tputRecUnmap`, `latencyAvgRecUnmap`, `recUnmapCount`, ... (+17 more) | UNMAP IO |
+| `host-remotedomclient` | modelled, never observed (keys unverified) | 3 | 3 | 0 | `iopsUnmap`, `latencyAvgUnmap`, `throughputUnmap` | UNMAP IO |
+| `host-zdom-top-stats` | observed (4 objects) | 5 | 0 | 5 | `iopsUnmap`, `throughputUnmap`, `latencyAvgUnmap`, `unmapCount`, `unmapLatencyMaxUs` | UNMAP IO |
+| `vsan-esa-disk-layer` | observed (7 objects) | 12 | 0 | 12 | `iopsUnmapPerf`, `tputUnmapPerf`, `avgLatUnmapPerf`, `maxUnmapTimePerf`, `minUnmapTimePerf`, `iopsUnmapCapacity`, `tputUnmapCapacity`, `avgLatUnmapCapacity`, ... (+4 more) | UNMAP IO |
+| `vsan-esa-disk-scsifw` | observed (7 objects) | 4 | 0 | 4 | `iopsDevUnmap`, `throughputDevUnmap`, `latencyDevUnmap`, `ioCountDevUnmap` | UNMAP IO |
+| `zdom-vtx` | observed (4 objects) | 7 | 0 | 7 | `rateTxnUnmapTotalCacheMiss`, `rateTxnUnmapLogicalTreeCacheMiss`, `rateTxnUnmapMiddleTreeCacheMiss`, `rateTxnUnmapSutCacheMiss`, `latAvgTxnUnmap`, `latAvgTxnUnmapTotalIO`, `txnUnmapMaxLatUs` | UNMAP IO |
+
+**Gap / risk**
+
+* Well covered at the IO level across observed DOM, zDOM, ESA disk and device layers (table). Most of these ids are model-only (returned, not advertised).
+* No figure for space reclaimed and no guest-UNMAP enablement state.
+* HCIBench charts further unmap ids (pending unmap, segments unmapped) that no modelled type returns.
+
+**Open question -- where else the data might come from** (not asserted to exist): Enablement: the vendored bindings declare a `VsanUnmapConfig` data type (cluster config) -- configuration, not a metric.
+
+
+### 11.24 Deduplication and compression (OSA dedup & compression, ESA global dedup)
+
+*Term search* `dedup|compress|space efficiency` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-esa-dedup-domclient-io` (24), `cluster-esa-dedup-domcompmgr-io` (24), `cluster-esa-dedup-domowner-io` (24), `cluster-esa-dedup-store-chunksvc` (27), `cluster-esa-dedup-store-hashsvc` (34), `host-esa-dedup-domclient-io` (24), `host-esa-dedup-domcompmgr-io` (24), `host-esa-dedup-domowner-io` (24), `host-esa-dedup-store-chunksvc` (27), `host-esa-dedup-store-hashsvc` (34), `vsan-cluster-capacity` (2)
+* model ids NOT advertised by the schema: `host-domowner`: `numSuspendedDedupResyncJobs`, `numInflightDedupResyncJobs`, `numPendingDedupResyncJobs`
+* HCIBench ids not in our model: 38 -- `capacityCompressed`, `compressPct`, `compressionTime`, `dataWriteTime`, `ddpFreeCap`, `ddpTotalCap`, `dedupCcheHitRt`, `dedupPct`, `dedupTput`, `dedupedBytes`, ... (+28 more)
+* vendored vSAN Management API methods matching `DataEfficiency|Dedup|Compress`: `VimClusterVsanVcDiskManagementSystem.QueryClusterDataEfficiencyCapacityState`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-cluster-capacity` | direct | schema text: savedByDedup, dedupRatio (space efficiency) | ClusterComputeResource `cptvsan\|Capacity` | live | observed (1 objects) | 5 | 6 | no | How much physical capacity saved by space efficiency feature. |
+| `cluster-esa-dedup-domclient-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|DOM Client I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Client. |
+| `cluster-esa-dedup-domcompmgr-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|DOM Component Manager I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Component Manager. |
+| `cluster-esa-dedup-domowner-io` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|DOM Owner I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Cluster level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Owner. |
+| `cluster-esa-dedup-store-chunksvc` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|Chunk Service` | provisional | modelled, never observed (keys unverified) | 27 | 27 | yes | Cluster level reported chunk objects from the perspective of IO entering the vSAN ESA global dedup chunk service. |
+| `cluster-esa-dedup-store-hashsvc` | direct | name: ESA global dedup | ClusterComputeResource `cptvsan\|ESA Dedup\|Hash Service` | provisional | modelled, never observed (keys unverified) | 34 | 34 | yes | Cluster level unique hash request count from the perspective of IO entering the vSAN ESA global dedup hash service. |
+| `host-esa-dedup-domclient-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|DOM Client I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Client. |
+| `host-esa-dedup-domcompmgr-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|DOM Component Manager I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Component Manager. |
+| `host-esa-dedup-domowner-io` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|DOM Owner I/O` | provisional | modelled, never observed (keys unverified) | 24 | 24 | yes | Host level dedup average read latency from the perspective of IO entering the vSAN ESA DOM Owner. |
+| `host-esa-dedup-store-chunksvc` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|Chunk Service` | provisional | modelled, never observed (keys unverified) | 27 | 27 | yes | Host level reported chunk objects from the perspective of IO entering the vSAN ESA global dedup chunk service. |
+| `host-esa-dedup-store-hashsvc` | direct | name: ESA global dedup | HostSystem `cptvsan\|ESA Dedup\|Hash Service` | provisional | modelled, never observed (keys unverified) | 34 | 34 | yes | Host level unique hash request count from the perspective of IO entering the vSAN ESA global dedup hash service. |
+
+**Gap / risk**
+
+* The ten ESA global-dedup types are never observed; all are feature-gated (`FEATURE_ENTITIES`).
+* Compression: no schema text matches "compress"; HCIBench charts `totalCompressedBytes`, `compressPct` and others (see hits) that no modelled type returns.
+* OSA dedup per disk group: no `disk-group` metric matches dedup.
+* `dedupRatio` is ratio x 100 with no expressible unit (section 6.6).
+
+**Open question -- where else the data might come from** (not asserted to exist): `QueryClusterDataEfficiencyCapacityState` (vendored) for OSA dedup/compression state -- not verified.
+
+
+### 11.25 Snapshots and delta disks
+
+*Term search* `snapshot|\bsnap|delta|sparse` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cmmds-workload` (4), `host-vsansparse` (12), `vsan-dp-historical-stats` (1)
+* model ids NOT advertised by the schema: `cluster-domowner`: `avgDeltaCreationDomActiveLatency`, `avgDeltaCreationDomCreationLatency`, `numCompleteDeltaToBaseResyncOps`, `numCompleteSiblingToDeltaResyncOps`, `numPendingDeltaToBaseResyncJobs`, `numPendingSiblingToDeltaResyncJobs`, ... (+5 more); `host-domowner`: `numPendingDeltaToBaseResyncJobs`, `numPendingSiblingToDeltaResyncJobs`, `numRunningDeltaToBaseResyncJobs`, `numRunningSiblingToDeltaResyncJobs`, `numSuspendedDeltaToBaseResyncJobs`, `numSuspendedSiblingToDeltaResyncJobs`, ... (+13 more)
+* HCIBench ids not in our model: 15 -- `deltaDecomSuccessCount`, `ioSizeTxnDelExtMiddleTreeLog`, `ioSizeTxnSnapDelMetaUpdateLog`, `ioSizeTxnSnapDeleteLog`, `latAvgSnapCreate`, `latAvgSnapDelete`, `numDelTasks`, `plannedDeltaComponents`, `snapCreateCount`, `snapDeleteCount`, ... (+5 more)
+* vendored vSAN Management API methods matching `Snapshot|Delta`: none
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `host-vsansparse` | *inference* | schema text: "vSAN sparse" (INFERENCE: the vsanSparse snapshot format) | HostSystem `cptvsan\|Storage I/O\|vsanSparse` | live | observed (4 objects) | 12 | 21 | no | vSAN sparse host cache lookup latency. |
+| `vsan-dp-historical-stats` | direct | schema text: "Used By Snapshots" | ClusterComputeResource `cptvsan\|Services\|Data Protection` | live | observed (1 objects) | 1 | 1 | no | Used By Snapshots. |
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `cluster-domowner` | observed (1 objects) | 11 | 0 | 11 | `avgDeltaCreationDomActiveLatency`, `avgDeltaCreationDomCreationLatency`, `numCompleteDeltaToBaseResyncOps`, `numCompleteSiblingToDeltaResyncOps`, `numPendingDeltaToBaseResyncJobs`, `numPendingSiblingToDeltaResyncJobs`, `numRunningDeltaToBaseResyncJobs`, `numRunningSiblingToDeltaResyncJobs`, ... (+3 more) | delta-component creation / resync type |
+| `host-domowner` | observed (4 objects) | 19 | 0 | 19 | `numPendingDeltaToBaseResyncJobs`, `numPendingSiblingToDeltaResyncJobs`, `numRunningDeltaToBaseResyncJobs`, `numRunningSiblingToDeltaResyncJobs`, `numSuspendedDeltaToBaseResyncJobs`, `numSuspendedSiblingToDeltaResyncJobs`, `deltaSourceChanges`, `resyncsStartedAsDeltaToBase`, ... (+11 more) | delta-component creation / resync type |
+| `cmmds-workload` | modelled, never observed (keys unverified) | 4 | 4 | 0 | `rxSnapshot`, `txSnapshot`, `txSnapshotBytes`, `txSnapshotTried` | schema text "CMMDS workload ... snapshot": CMMDS directory snapshots, NOT VM snapshots (inference from wording) |
+
+**Gap / risk**
+
+* `vsan-dp-historical-stats` is ONE metric (`totalSnapshotCapacity`). `host-vsansparse` is host aggregate IO with no per-VM or per-chain key.
+* HCIBench charts zDOM snapshot create/delete counts and latencies (`snapCreateCount`, `latAvgSnapCreate`, ...) that no modelled type returns.
+* No per-VM snapshot count, chain depth or age in the schema.
+
+**Open question -- where else the data might come from** (not asserted to exist): Snapshot inventory is a vCenter VM property (VMWARE adapter).
+
+
+### 11.26 Linked clones
+
+*Term search* `linked|clone` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 1 -- `sgElemSizeCloneBuffer`
+* vendored vSAN Management API methods matching `Clone`: none
+
+**No Performance Service entity type in the captured schema covers this.**
+
+**Gap / risk**
+
+* Nothing names linked clones. INFERENCE: a linked clone's IO goes through its own delta disk path and the shared base disk; base-disk IO keyed by the base path would land on whichever VM owns that path in the map.
+
+**Open question -- where else the data might come from** (not asserted to exist): Clone topology is a vCenter VM property.
+
+
+**Group C -- Integrity, resilience and operations**
+
+### 11.27 Resync / repair
+
+*Term search* `resync|repair|rebuild|fixcomp` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-domcompmgr` (6), `cluster-domowner` (6), `cluster-resync` (24), `disk-group` (30), `host-domcompmgr` (6), `host-domowner` (7)
+* model ids NOT advertised by the schema: `cluster-domowner`: `avgResyncParallelism`, `numCompleteResyncOps`, `numCompleteResyncRwrBatches`, `numInflightPriorityResyncJobs`, `numInflightSharedResyncJobs`, `numPendingDecomResyncJobs`, ... (+18 more); `host-domclient`: `oioResyncRead`; `host-domcompmgr`: `resyncReadCount`, `resyncReadCongestion`, `resyncQueueDepthRead`, `resyncQueueDepthWrite`, `resyncDispatchedCostRead`, `resyncDispatchedCostWrite`, ... (+1 more); `host-domowner`: `resyncReadCount`, `numCompleteResyncOps`, `numCompleteResyncRwrBatches`, `avgResyncParallelism`, `numPendingResyncJobs`, `numPendingDecomResyncJobs`, ... (+55 more)
+* HCIBench ids not in our model: 34 -- `anchorIopsRWResync`, `anchorLatencyAvgRWResync`, `anchorRWResyncCongestion`, `anchorRWResyncCount`, `anchorTputRWResync`, `curBytesToSyncFixComp`, `curBytesToSyncRepair`, `fixComplianceQueuedBytes`, `fixComplianceQueuedObjects`, `forceRepairSuccessCount`, ... (+24 more)
+* vendored vSAN Management API methods matching `Sync|Repair`: `HostVsanHealthSystem.VsanHostRepairImmediateObjects`, `VsanClusterHealthSystem.VsanQueryClusterAdvCfgSync`, `VsanClusterHealthSystem.VsanRepairClusterImmediateObjects`, `VsanObjectSystem.QuerySyncingVsanObjectsSummary`, `VsanSystemEx.VsanQuerySyncingVsanObjects`, `VsanUpgradeSystemEx.PerformVsanUpgradePreflightAsyncCheck_Task`, `VsanVcClusterHealthSystem.VsanHealthRepairClusterObjectsImmediate`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-resync` | direct | schema text: resync by reason (policy, evacuation, rebalance, repair) | ClusterComputeResource `cptvsan\|Resync` | provisional | modelled, never observed (keys unverified) | 24 | 24 | no | Cluster resync policy change read IOPS. |
+| `disk-group` | direct | schema text: OSA disk-group resync by reason | HostSystem `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 38 | 38 | no | DOM component scheduler latency. |
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `cluster-domcompmgr` | observed (1 objects) | 6 | 6 | 0 | `iopsRecWrite`, `throughputRecWrite`, `latencyAvgRecWrite`, `iopsResyncRead`, `tputResyncRead`, `latAvgResyncRead` | resync / recovery IO and job counts |
+| `cluster-domowner` | observed (1 objects) | 30 | 6 | 24 | `avgResyncParallelism`, `numCompleteResyncOps`, `numCompleteResyncRwrBatches`, `numInflightPriorityResyncJobs`, `numInflightSharedResyncJobs`, `numPendingDecomResyncJobs`, `numPendingResyncJobs`, `numRunningResyncJobs`, ... (+22 more) | resync / recovery IO and job counts |
+| `host-domclient` | observed (4 objects) | 2 | 0 | 2 | `oioResyncRead`, `oioRecoveryWrite` | resync / recovery IO and job counts |
+| `host-domcompmgr` | observed (4 objects) | 19 | 9 | 10 | `iopsRecWrite`, `throughputRecWrite`, `latencyAvgRecWrite`, `recWriteCount`, `iopsResyncRead`, `tputResyncRead`, `latAvgResyncRead`, `resyncReadCount`, ... (+11 more) | resync / recovery IO and job counts |
+| `host-domowner` | observed (4 objects) | 88 | 7 | 81 | `recoveryWriteCongestion`, `iopsResyncRead`, `tputResyncRead`, `latencyAvgResyncRead`, `resyncReadCount`, `iopsRecWrite`, `tputRecWrite`, `latencyAvgRecWrite`, ... (+80 more) | resync / recovery IO and job counts |
+
+**Gap / risk**
+
+* Resync IO and job counts are well covered in the OBSERVED DOM families (table), mostly model-only (not advertised).
+* `cluster-resync`, the only per-REASON breakdown on ESA, is never observed; it is not in FEATURE_ENTITIES. Whether it returns data during an actual resync is the measurement that would settle it.
+* No bytes-left-to-sync or ETA in the schema; HCIBench charts `curBytesToSync*` from an unrecorded type.
+
+**Open question -- where else the data might come from** (not asserted to exist): `QuerySyncingVsanObjectsSummary`, `VsanQuerySyncingVsanObjects` (vendored) for bytes remaining.
+
+
+### 11.28 Proactive rebalancing
+
+*Term search* `rebalanc` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-domcompmgr` (3), `cluster-domowner` (2), `cluster-resync` (6), `disk-group` (6), `host-domcompmgr` (3), `host-domowner` (2)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 7 -- `curBytesToSyncRebalance`, `proactiveRebalanceSuccessCount`, `reactiveRebalanceSuccessCount`, `readCountRebalance`, `rebalanceQueuedBytes`, `rebalanceQueuedObjects`, `recWriteCountRebalance`
+* vendored vSAN Management API methods matching `Rebalanc`: `HostVsanHealthSystem.VsanGetProactiveRebalanceInfo`, `HostVsanHealthSystem.VsanStartProactiveRebalance`, `HostVsanHealthSystem.VsanStopProactiveRebalance`, `VsanVcClusterHealthSystem.VsanHealthIsRebalanceRunning`, `VsanVcClusterHealthSystem.VsanRebalanceCluster`, `VsanVcClusterHealthSystem.VsanStopRebalanceCluster`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-resync` | direct | schema text: "rebalance" resync IO | ClusterComputeResource `cptvsan\|Resync` | provisional | modelled, never observed (keys unverified) | 24 | 24 | no | Cluster resync policy change read IOPS. |
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `cluster-resync` | modelled, never observed (keys unverified) | 6 | 6 | 0 | `iopsResyncReadRebalance`, `iopsResyncWriteRebalance`, `latResyncReadRebalance`, `latResyncWriteRebalance`, `tputResyncReadRebalance`, `tputResyncWriteRebalance` | rebalance resync IO |
+| `disk-group` | modelled, never observed (keys unverified) | 6 | 6 | 0 | `iopsResyncReadRebalance`, `iopsResyncWriteRebalance`, `latResyncReadRebalance`, `latResyncWriteRebalance`, `tputResyncReadRebalance`, `tputResyncWriteRebalance` | rebalance resync IO |
+
+**Gap / risk**
+
+* Rebalance appears only as a resync reason (per cluster or per OSA disk group); both types are never observed.
+* No running / not-running state, no imbalance figure. HCIBench charts `proactiveRebalanceSuccessCount`, `rebalanceQueuedBytes` from an unrecorded type.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanHealthIsRebalanceRunning`, `VsanGetProactiveRebalanceInfo` (vendored).
+
+
+### 11.29 Cluster shutdown / maintenance-mode data evacuation
+
+*Term search* `evacuat|decom|maintenance|shutdown` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `clom-host` (1), `cluster-domcompmgr` (3), `cluster-domowner` (2), `cluster-resync` (6), `disk-group` (6), `host-domcompmgr` (3), `host-domowner` (2)
+* model ids NOT advertised by the schema: `cluster-domowner`: `numPendingDecomResyncJobs`; `host-domowner`: `numPendingDecomResyncJobs`
+* HCIBench ids not in our model: 7 -- `curBytesToSyncDecom`, `decomQueuedBytes`, `decomQueuedObjects`, `decomSuccessCount`, `deltaDecomSuccessCount`, `readCountDecom`, `recWriteCountDecom`
+* vendored vSAN Management API methods matching `Evac|EMM|Maintenance|Shutdown`: `HostVsanHealthSystem.VsanQueryHostEMMState`, `VsanSystemEx.VsanQueryWhatIfEvacuationResult`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-resync` | direct | schema text: "evacuation" resync IO | ClusterComputeResource `cptvsan\|Resync` | provisional | modelled, never observed (keys unverified) | 24 | 24 | no | Cluster resync policy change read IOPS. |
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `cluster-domowner` | observed (1 objects) | 1 | 0 | 1 | `numPendingDecomResyncJobs` | evacuation (decommission) resync IO / jobs |
+| `cluster-resync` | modelled, never observed (keys unverified) | 6 | 6 | 0 | `iopsResyncReadDecom`, `iopsResyncWriteDecom`, `latResyncReadDecom`, `latResyncWriteDecom`, `tputResyncReadDecom`, `tputResyncWriteDecom` | evacuation (decommission) resync IO / jobs |
+| `disk-group` | modelled, never observed (keys unverified) | 6 | 6 | 0 | `iopsResyncReadDecom`, `iopsResyncWriteDecom`, `latResyncReadDecom`, `latResyncWriteDecom`, `tputResyncReadDecom`, `tputResyncWriteDecom` | evacuation (decommission) resync IO / jobs |
+| `host-domowner` | observed (4 objects) | 1 | 0 | 1 | `numPendingDecomResyncJobs` | evacuation (decommission) resync IO / jobs |
+
+**Gap / risk**
+
+* Evacuation IO exists as resync-by-reason (never observed) and `numPendingDecomResyncJobs` (observed DOM owner, model-only).
+* No maintenance-mode state or what-if result in the schema. INFERENCE: a host in maintenance mode keeps its keys and its series go flat or stop, indistinguishable from a collection problem.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanQueryWhatIfEvacuationResult`, `VsanQueryHostEMMState` (vendored).
+
+
+### 11.30 Health checks
+
+*Term search* `\bhealth|alarm|\bddh\b` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `ddh-disk` (10)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Health`: `HostVsanHealthSystem.VsanHostCreateVmHealthTest`, `HostVsanHealthSystem.VsanHostQueryEncryptionHealthSummary`, `HostVsanHealthSystem.VsanHostQueryFileServiceHealthSummary`, `HostVsanHealthSystem.VsanHostQueryHealthSystemVersion`, `HostVsanHealthSystem.VsanHostQueryObjectHealthSummary`, `HostVsanHealthSystem.VsanHostQueryPhysicalDiskHealthSummary`, `HostVsanHealthSystem.VsanWaitForVsanHealthGenerationIdChange`, `VsanClusterHealthSystem.VsanQueryClusterCreateVmHealthTest`, `VsanClusterHealthSystem.VsanQueryClusterHealthSystemVersions`, `VsanClusterHealthSystem.VsanQueryClusterPhysicalDiskHealthSummary`, `VsanPerformanceManager.VsanPerfQueryClusterHealth`, `VsanPhoneHomeSystem.QueryVsanCloudHealthStatus`, `VsanPhoneHomeSystem.VsanPerformOnlineHealthCheck`, `VsanVcClusterHealthSystem.VsanClusterQueryFileServiceHealthSummary`, `VsanVcClusterHealthSystem.VsanHealthGetVsanClusterSilentChecks`, `VsanVcClusterHealthSystem.VsanHealthIsRebalanceRunning`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanClusterHealthCheckInterval`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanClusterHealthConfig`, `VsanVcClusterHealthSystem.VsanHealthQueryVsanProxyConfig`, `VsanVcClusterHealthSystem.VsanHealthRepairClusterObjectsImmediate`, `VsanVcClusterHealthSystem.VsanHealthSendVsanTelemetry`, `VsanVcClusterHealthSystem.VsanHealthSetLogLevel`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterHealthCheckInterval`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterSilentChecks`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterTelemetryConfig`, `VsanVcClusterHealthSystem.VsanHealthTestVsanClusterTelemetryProxy`, `VsanVcClusterHealthSystem.VsanQueryAllSupportedHealthChecks`, `VsanVcClusterHealthSystem.VsanQueryVcClusterCreateVmHealthHistoryTest`, `VsanVcClusterHealthSystem.VsanQueryVcClusterCreateVmHealthTest`, `VsanVcClusterHealthSystem.VsanQueryVcClusterHealthSummary` (**used by the pack**), `VsanVcClusterHealthSystem.VsanQueryVcClusterHealthSummaryTask`, `VsanVcClusterHealthSystem.VsanVcClusterQueryVerifyHealthSystemVersions`
+
+**No Performance Service entity type in the captured schema covers this.**
+
+**Gap / risk**
+
+* The captured schema carries no health-check results. `ddh-disk` matches the term search only because its schema text says "vSAN DDH disk"; its metrics are IO, latency and log congestion. The pack's group name `Disks|Health` comes from `tools/build_model_extra.py` `label_for` expanding "ddh" to "Disk Health" -- an inference the schema never makes.
+* The pack DOES call the cluster health system (`VsanQueryVcClusterHealthSummary` with `fields=["hclInfo"]`) only to read controller driver versions for disk-hardware PROPERTIES.
+
+**Open question -- where else the data might come from** (not asserted to exist): The vendored bindings declare 32 methods whose names contain "Health" (listed above); which checks matter is a content decision.
+
+
+### 11.31 Device health / SMART (and `ddh-disk`)
+
+*Term search* `smart|wear|endurance|\bddh\b|media error` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `ddh-disk` (10)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Smart|PhysicalDisk`: `HostVsanHealthSystem.VsanHostQueryPhysicalDiskHealthSummary`, `HostVsanHealthSystem.VsanHostQuerySmartStats`, `VsanClusterHealthSystem.VsanQueryClusterPhysicalDiskHealthSummary`, `VsanVcClusterHealthSystem.VsanQueryVcClusterSmartStatsSummary`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `ddh-disk` | direct | name; schema text "vSAN DDH disk" (IO, latency, log congestion -- not SMART) | HostSystem `cptvsan\|Disks\|Health:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 10 | 10 | no | vSAN DDH disk read IOPS. |
+
+**Gap / risk**
+
+* `ddh-disk` is never observed and its wildcard query faults (`tools/build_model_extra.py` docstring). No SMART attribute, wear level or media-error count is in the schema.
+* "DDH" is not expanded anywhere in the schema; treating it as health is inference.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanHostQuerySmartStats`, `VsanQueryVcClusterSmartStatsSummary`, `VsanHostQueryPhysicalDiskHealthSummary` (vendored).
+
+
+### 11.32 Controller / HBA queue depth and NVMe device latency
+
+*Term search* `queue|\boio\b|outstanding|devd|devk|devg` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cache-disk` (2), `capacity-disk` (2), `cluster-domclient` (1), `cluster-domcompmgr` (1), `cluster-domowner` (1), `cluster-rdt-network-latency` (3), `cluster-remotedomclient` (1), `computeCluster-remotedomclient` (1), `computeHost-remotedomclient` (1), `disk-group` (1), `host-domclient` (1), `host-domcompmgr` (1), `host-domowner` (1), `host-remotedomclient` (1), `vsan-direct-cluster` (2), `vsan-direct-host` (2), `vsan-esa-disk-scsifw` (2), `vsan-iscsi-host` (1), `vsan-iscsi-lun` (1), `vsan-iscsi-target` (1)
+* model ids NOT advertised by the schema: `cluster-zdom-top-stats`: `oio`; `host-domclient`: `avgBurstPeakOutstandingKb`, `avgBurstPeakOutstandingKbMultiObj`; `host-domcompmgr`: `metadataQueueDepthRead`, `metadataQueueDepthWrite`, `namespaceQueueDepthRead`, `namespaceQueueDepthWrite`, `resyncQueueDepthRead`, `resyncQueueDepthWrite`, ... (+2 more); `host-zdom-top-stats`: `oio`; `vsan-esa-disk-scsifw`: `latencyDevKAvg`, `outstandingCmdCount`
+* HCIBench ids not in our model: 53 -- `changeQueuedBytes`, `changeQueuedObjects`, `concatQueuedBytes`, `concatQueuedObjects`, `consolidateQueuedBytes`, `consolidateQueuedObjects`, `currentOutstandingTasks`, `decomQueuedBytes`, `decomQueuedObjects`, `fixComplianceQueuedBytes`, ... (+43 more)
+* vendored vSAN Management API methods matching `Controller|ScsiController|Queue`: `HostVsanHealthSystem.VsanFlashScsiControllerFirmware_Task`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-esa-disk-scsifw` | direct | schema text: physical/firmware layer device latency | HostSystem `cptvsan\|Disks\|ESA Disk:{disk_uuid}` | live | observed (7 objects) | 8 | 16 | no | vSAN Express Storage Architecture disk physical/firmware layer Read IOPS. |
+| `cache-disk` | direct | OSA device latency | HostSystem `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 8 | 8 | no | vSAN disk physical/firmware layer read IOPS. |
+| `capacity-disk` | direct | OSA device latency | HostSystem `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 13 | 13 | no | vSAN disk physical/firmware layer read IOPS. |
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `vsan-esa-disk-scsifw` | observed (7 objects) | 4 | 2 | 2 | `latencyDevDAvg`, `latencyDevGAvg`, `latencyDevKAvg`, `outstandingCmdCount` | device / kernel / guest average latency, outstanding commands |
+| `host-domcompmgr` | observed (4 objects) | 8 | 0 | 8 | `metadataQueueDepthRead`, `metadataQueueDepthWrite`, `namespaceQueueDepthRead`, `namespaceQueueDepthWrite`, `resyncQueueDepthRead`, `resyncQueueDepthWrite`, `vmdiskQueueDepthRead`, `vmdiskQueueDepthWrite` | DOM scheduler queue depth by class |
+
+**Gap / risk**
+
+* ESA device latency (DAVG/KAVG/GAVG split, outstanding commands) is observed per disk. The test fixtures use NVMe device names and section 6.6 cites an idle NVMe cluster, so on that cluster this IS the NVMe device-latency view.
+* No controller/adapter-level queue depth or adapter latency: every device metric is keyed by disk uuid, none by controller.
+
+**Open question -- where else the data might come from** (not asserted to exist): Controller identity (scsiTopology) and driver version (health summary `hclInfo`) are already read for disk properties; adapter queue statistics would come from ESXi / vCenter host counters -- not verified.
+
+
+### 11.33 Encryption (data at rest)
+
+*Term search* `encrypt|crypt|\bkms\b|\bdek\b|\bkek\b|cipher` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Encrypt|Rekey|Kms`: `HostVsanHealthSystem.VsanHostQueryEncryptionHealthSummary`, `VsanVcClusterConfigSystem.VsanEncryptedClusterRekey_Task`
+
+**No Performance Service entity type in the captured schema covers this.**
+
+**Gap / risk**
+
+* Nothing in the schema, model or HCIBench vocabulary mentions encryption. INFERENCE: its CPU cost would surface only in `vsan-cpu` / world CPU, unattributed.
+* `docs/assets/dashboard.broadcom-vsan-esa.json` reads `Configuration|vSAN|encryption` -- a property on another adapter's objects.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanHostQueryEncryptionHealthSummary`, `VsanEncryptedClusterRekey_Task` (vendored).
+
+
+### 11.34 Data-in-transit encryption
+
+*Term search* `transit|\bdit\b|\btls\b|encrypt` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Transit`: none
+
+**No Performance Service entity type in the captured schema covers this.**
+
+**Gap / risk**
+
+* Nothing names data-in-transit encryption. INFERENCE: its overhead would appear only indirectly, in RDT latency and vSAN CPU.
+
+**Open question -- where else the data might come from** (not asserted to exist): Enablement is cluster configuration; no vendored method name matches.
+
+
+### 11.35 Data protection (vSAN data protection / snapshot service)
+
+*Term search* `protect|\bdp\b|\bdp[A-Z]` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `vsan-dp-historical-stats` (1)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Protect|Dp[A-Z]`: none
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-dp-historical-stats` | direct | name; schema graph `dpcapacity` | ClusterComputeResource `cptvsan\|Services\|Data Protection` | live | observed (1 objects) | 1 | 1 | no | Used By Snapshots. |
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `vsan-cluster-capacity` | observed (1 objects) | 1 | 0 | 1 | `totalDpOverhead` | data-protection overhead (model-only) |
+
+**Gap / risk**
+
+* Observed, but one advertised metric (`totalSnapshotCapacity`) plus `totalDpOverhead` on capacity. No protection-group, schedule, RPO or replication metric.
+
+**Open question -- where else the data might come from** (not asserted to exist): Protection groups are managed by a separate appliance (inference); not named in the vendored bindings.
+
+
+**Group D -- Network**
+
+### 11.36 RDMA / RoCE networking
+
+*Term search* `rdma|\broce\b|infiniband|\bverbs\b|pfc|priority flow|\bdcb\b|ecn` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): **no hits**
+* model ids NOT advertised by the schema: `vsan-pnic-net`: `pfcCount`, `pfcCountActual`, `pfcCountRaw`; `vsan-tcpip-stats`: `tcpEcnCe`; `vsan-vnic-net`: `tcpEcnCe`
+* HCIBench ids not in our model: 6 -- `pri3ReceivedPFCFrames`, `pri3SentPFCFrames`, `pri4ReceivedPFCFrames`, `pri4SentPFCFrames`, `pri5ReceivedPFCFrames`, `pri5SentPFCFrames`
+* vendored vSAN Management API methods matching `Rdma|Roce`: none
+
+**No Performance Service entity type in the captured schema covers this.** Related metrics exist inside broader entity types (metric-level table below).
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `vsan-pnic-net` | observed (7 objects) | 2 | 0 | 2 | `pfcCount`, `pfcCountRaw` | Priority Flow Control count (INFERENCE: PFC is the lossless-Ethernet mechanism RoCE usually relies on) |
+| `vsan-tcpip-stats` | observed (4 objects) | 1 | 0 | 1 | `tcpEcnCe` | TCP ECN congestion-experienced (a TCP counter, not RDMA) |
+| `vsan-vnic-net` | observed (4 objects) | 1 | 0 | 1 | `tcpEcnCe` | TCP ECN congestion-experienced (a TCP counter, not RDMA) |
+
+**Gap / risk**
+
+* Disk-scoped or vmknic-scoped RDMA counters: none in any source (term search over schema text, model ids, HCIBench ids and vendored method names returns no `rdma`/`roce`).
+* `pfcCount*` is OBSERVED but not advertised (model-only). It is one aggregate; HCIBench charts per-priority `pri{3,4,5}{Sent,Received}PFCFrames` that no modelled type returns.
+* `pfcCount` is NOT in `perfsvc.PERMILLE` (computed: False) while HCIBench titles it "Flow Control (per-mille)"; the sibling `pauseCount` IS converted. Open: same treatment?
+* INFERENCE: RDMA traffic bypasses the TCP/IP stack, so `vsan-tcpip-stats`, `vsan-vnic-net` TCP counters and RDT socket metrics would not describe it. Unverified.
+
+**Open question -- where else the data might come from** (not asserted to exist): RDMA device statistics would come from ESXi (RDMA device / vmrdma counters) -- not named anywhere in this repository.
+
+
+### 11.37 Network diagnostics (TCP/IP, pNIC, vmknic, RDT, CMMDS)
+
+*Term search* `\btcp|pnic|vmknic|\bnic\b|\brdt\b|cmmds net|packet` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-rdt-network-latency` (15), `cmmds-net` (10), `rdt-net` (1), `rdt-network-latency` (1), `vnic-rdt-network-latency` (1), `vsan-host-net` (6), `vsan-pnic-net` (16), `vsan-tcpip-stats` (16), `vsan-vnic-net` (6)
+* model ids NOT advertised by the schema: `vsan-host-net`: `tcpTxPackets`, `tcpRxPackets`, `tcpTxRexmitRate`, `tcpRxErrRate`; `vsan-pnic-net`: `rxPacketsLossRateActual`, `txPacketsLossRateActual`; `vsan-tcpip-stats`: `tcpTxRexmitRate`, `tcpRxErrRate`, `tcpEcnCe`, `tcpSndZeroWinActual`, `tcpRcvduppackRateActual`, `tcpRcvoopackRateActual`, ... (+7 more); `vsan-vnic-net`: `tcpTxPackets`, `tcpRxPackets`, `tcpTxRexmitRate`, `tcpRxErrRate`, `tcpConnects`, `tcpSndacks`, ... (+35 more)
+* HCIBench ids not in our model: 4 -- `maxRDTConnCountReached`, `rdtConnCount`, `rxPacketsErrorRate`, `txPacketsErrorRate`
+* vendored vSAN Management API methods matching `Network|Iperf|Pcap|NetworkPerf`: `HostVsanHealthSystem.VsanHostQueryRunIperfClient`, `HostVsanHealthSystem.VsanHostQueryRunIperfServer`, `HostVsanHealthSystem.VsanHostQueryVerifyNetworkSettings`, `VsanClusterHealthSystem.VsanQueryClusterCaptureVsanPcap`, `VsanClusterHealthSystem.VsanQueryClusterNetworkPerfTest`, `VsanClusterHealthSystem.VsanQueryVerifyClusterNetworkSettings`, `VsanVcClusterHealthSystem.VsanQueryVcClusterNetworkPerfHistoryTest`, `VsanVcClusterHealthSystem.VsanQueryVcClusterNetworkPerfTest`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-pnic-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|Physical NIC:{vmnic}` | live | observed (7 objects) | 16 | 65 | no | Physical NIC Throughput Inbound. |
+| `vsan-vnic-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|VMkernel NIC:{vmknic}` | live | observed (4 objects) | 8 | 64 | no | VMkernel Network Adapter Throughput Inbound. |
+| `vsan-tcpip-stats` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|TCP/IP Stack:{stack}` | live | observed (4 objects) | 16 | 32 | no | VMkernel Network Adapter TCP outbound packets. |
+| `vsan-host-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|Host` | live | observed (4 objects) | 8 | 16 | no | Host Throughput Inbound of All VMkernel Network Adapters Enabled vSAN Traffic. |
+| `rdt-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|RDT\|Net` | live | observed (4 objects) | 1 | 1 | no | RDT net checksum mismatch count. |
+| `rdt-network-latency` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|RDT\|Host Latency` | live | observed (4 objects) | 1 | 17 | no | RDT network host average latency for last 5 seconds. |
+| `vnic-rdt-network-latency` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|RDT\|VMkernel Latency:{vmknic}` | live | observed (4 objects) | 1 | 17 | no | RDT network vnic average latency for last 5 seconds. |
+| `cluster-rdt-network-latency` | direct | name / schema text: network | ClusterComputeResource `cptvsan\|Network\|RDT\|Cluster Latency` | live | observed (1 objects) | 15 | 17 | no | RDT network cluster average latency for last 5 seconds. |
+| `cmmds-net` | direct | name / schema text: network | HostSystem `cptvsan\|Network\|CMMDS` | live | observed (4 objects) | 10 | 10 | no | CMMDS network read inbound. |
+
+**Gap / risk**
+
+* All observed. The service returns far more than it advertises (computed per type in the model-vs-schema table at the top of this section).
+* RDT latency is per cluster / host / vmknic, never per PEER host, so a single bad path cannot be isolated.
+* Unit disputes recorded in section 6.6 (`rxSbSpaceMin`, `portRxDrops`, `tcpErrs`).
+
+**Open question -- where else the data might come from** (not asserted to exist): Active tests (`VsanQueryVcClusterNetworkPerfTest`, iperf) are declared in the vendored bindings; they generate load and are not monitoring.
+
+
+**Group E -- Further areas found in the schema and the model**
+
+### 11.38 Placement and cluster membership (CLOM, CMMDS, distribution)
+
+*Term search* `\bclom|cmmds|distribution` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `clom-disk` (3), `clom-host` (2), `cmmds-net` (10), `cmmds-workload` (23), `ioinsight` (60), `vsan-distribution` (5)
+* model ids NOT advertised by the schema: `vsan-memory`: `clomdConsumedSize`, `cmmdsdConsumedSize`, `cmmdsTimeMachineConsumedSize`, `clomdReservedSize`, `cmmdsdReservedSize`, `cmmdsTimeMachineReservedSize`, ... (+6 more)
+* HCIBench ids not in our model: 6 -- `multiElevNumDdpMetadataReads`, `multiElevNumDdpMetadataWrites`, `multiElevNumGuestReads`, `numDdpMetadataReads`, `numDdpMetadataWrites`, `numGuestReads`
+* vendored vSAN Management API methods matching `Clomd|Cmmds`: `HostVsanHealthSystem.VsanHostClomdLiveness`, `VsanClusterHealthSystem.VsanCheckClusterClomdLiveness`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `clom-host` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement\|CLOM` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Node component count ratio on this ESXi host. |
+| `clom-disk` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement\|CLOM Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | no | Disk component count ratio on this ESXi host. |
+| `cmmds-workload` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement\|CMMDS Workload` | provisional | modelled, never observed (keys unverified) | 23 | 23 | no | CMMDS workload inbound accept. |
+| `vsan-distribution` | direct | name: CLOM / CMMDS / distribution | HostSystem `cptvsan\|Placement\|Distribution` | provisional | modelled, never observed (keys unverified) | 5 | 5 | no | Components. |
+
+**Gap / risk**
+
+* All four are never observed; `clom-disk` faults on wildcard query.
+* `cmmds-net` (network) is observed and covered under network.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanHostClomdLiveness`, `VsanCheckClusterClomdLiveness` (vendored).
+
+
+### 11.39 vSAN CPU and memory (worlds, heaps, slabs)
+
+*Term search* `\bcpu|world|heap|slab|memory` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `dom-world-cpu` (2), `heap-memory` (1), `host-cpu` (3), `lsom-world-cpu` (2), `slab-memory` (1), `system-mem` (2), `vsan-cpu` (3), `vsan-memory` (2)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 5 -- `heapAllocFailures`, `slabAllocFailures`, `slabCongestion`, `slabCongestionLocalMax`, `virstoInstanceHeapUtilization`
+* vendored vSAN Management API methods matching `RuntimeStats|DrsStats`: `VsanSystemEx.VsanHostGetRuntimeStats`, `VsanSystemEx.VsanQueryHostDrsStats`, `VsanVcClusterConfigSystem.VsanClusterGetRuntimeStats`, `VsanVcClusterConfigSystem.VsanQueryClusterDrsStats`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU\|vSAN` | live | observed (4 objects) | 3 | 7 | no | Percentage of used CPU time |
+| `host-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU\|Core:{cpu}` | live | observed (244 objects) | 3 | 3 | no | Percentage of CPU core uitilization. |
+| `dom-world-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU\|DOM World:{world_name}-{world_id}` | live | observed (315 objects) | 2 | 3 | no | Percentage of used CPU time |
+| `lsom-world-cpu` | direct | name: CPU / memory | HostSystem `cptvsan\|CPU\|LSOM World:{world_name}-{world_id}` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Percentage of used CPU time |
+| `vsan-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory\|vSAN` | live | observed (4 objects) | 2 | 50 | no | Kernel Reserved Memory Size. |
+| `system-mem` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory\|System` | live | observed (4 objects) | 3 | 3 | no | System total memory used. |
+| `heap-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory\|Heap:{heap_name}` | provisional | modelled, never observed (keys unverified) | 1 | 1 | no | Heap utilization. |
+| `slab-memory` | direct | name: CPU / memory | HostSystem `cptvsan\|Memory\|Slab:{slab_name}` | provisional | modelled, never observed (keys unverified) | 1 | 1 | no | Slab utilization. |
+
+**Gap / risk**
+
+* `lsom-world-cpu`, `heap-memory`, `slab-memory` never observed; `heap-memory` faults on wildcard query (`tools/build_model_extra.py` docstring, which adds "and others" without naming them). `dom-world-cpu` has the most observed objects of any type (`dom-world-cpu` 315 vs next `host-cpu` 244).
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanHostGetRuntimeStats`, `VsanClusterGetRuntimeStats` (vendored).
+
+
+### 11.40 ESA log-structured object layer (zDOM, VTX)
+
+*Term search* `zdom|\bvtx\b|object backend` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-zdom-top-stats` (6), `host-zdom-top-stats` (6), `zdom-vtx` (2)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 15 -- `bankFlushError`, `bypassWritePercent`, `latAvgSnapCreate`, `latAvgSnapDelete`, `numZdomObjects`, `rateTxnCreateOpBankCount`, `rateTxnCreateOpSegMoveFreeCount`, `rateTxnCreateOpUnmapCount`, `snapCreateCount`, `snapDeleteCount`, ... (+5 more)
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `cluster-zdom-top-stats` | direct | name: zDOM | ClusterComputeResource `cptvsan\|zDOM\|Top Stats` | live | observed (1 objects) | 6 | 12 | no | Cluster level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
+| `host-zdom-top-stats` | direct | name: zDOM | HostSystem `cptvsan\|zDOM\|Top Stats` | live | observed (4 objects) | 6 | 19 | no | Host level read IOPS consumed from the perspective of IO entering the vSAN ESA object backend. |
+| `zdom-vtx` | direct | name: zDOM | HostSystem `cptvsan\|zDOM\|VTX` | live | observed (4 objects) | 2 | 71 | no | Cache miss per IOPS. |
+
+**Gap / risk**
+
+* Observed. `zdom-vtx` advertises 2 metrics and returns 71.
+* HCIBench charts many more zDOM ids (log, segment cleaning, snapshot) from unrecorded types.
+
+**Open question -- where else the data might come from** (not asserted to exist): None beyond identifying which types return the HCIBench ids.
+
+
+### 11.41 Disk layers (ESA disks, OSA disk groups / cache / capacity)
+
+*Term search* `disk group|cache tier|capacity tier|esa disk` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cache-disk` (8), `capacity-disk` (13), `disk-group` (27), `host-domcompmgr` (6), `vsan-esa-disk-layer` (6), `vsan-esa-disk-scsifw` (8)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `DiskMapping|ManagedDisks|DisksForVsan`: `VimClusterVsanVcDiskManagementSystem.InitializeDiskMappings`, `VimClusterVsanVcDiskManagementSystem.QueryDiskMappings`, `VimClusterVsanVcDiskManagementSystem.RebuildDiskMapping`, `VsanSystemEx.VsanUnmountDiskMappingEx`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `vsan-esa-disk-layer` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|ESA Disk:{disk_uuid}` | live | observed (7 objects) | 6 | 38 | no | vSAN layer read IOPS of vSAN Express Storage Architecture disk. |
+| `vsan-esa-disk-scsifw` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|ESA Disk:{disk_uuid}` | live | observed (7 objects) | 8 | 16 | no | vSAN Express Storage Architecture disk physical/firmware layer Read IOPS. |
+| `disk-group` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|OSA\|Disk Group:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 38 | 38 | no | DOM component scheduler latency. |
+| `cache-disk` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|OSA\|Cache Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 8 | 8 | no | vSAN disk physical/firmware layer read IOPS. |
+| `capacity-disk` | direct | name: disk layer | HostSystem `cptvsan\|Disks\|OSA\|Capacity Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 13 | 13 | no | vSAN disk physical/firmware layer read IOPS. |
+
+**Gap / risk**
+
+* ESA observed; all OSA types never observed (lab is ESA). OSA metric sets are the ADVERTISED sets, which understate what the service returns (as every observed type shows).
+
+**Open question -- where else the data might come from** (not asserted to exist): Run `tools/model_from_perfsvc.py` against an OSA cluster.
+
+
+### 11.42 VM, virtual disk and vSCSI
+
+*Term search* `virtual machine|\bvscsi|\bvmdk` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-domclient` (8), `cluster-remotedomclient` (8), `computeCluster-remotedomclient` (8), `host-domclient` (11), `ioinsight` (68), `remote-virtual-machine` (6), `remote-vscsi` (6), `virtual-machine` (6), `vsan-direct-cluster` (8), `vsan-direct-host` (8), `vscsi` (6)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `virtual-machine` | direct | name: VM level | VirtualMachine `cptvsan\|VM` | live | observed (30 objects) | 6 | 8 | no | Virtual machine read IOPS. |
+| `virtual-disk` | direct | name: VM level | VirtualMachine `cptvsan\|Virtual Disk:{vdisk_uuid}` | live | observed (60 objects) | 3 | 7 | no | The applied IOPS limit. |
+| `vscsi` | direct | name: VM level | VirtualMachine `cptvsan\|vSCSI:{device}` | live | observed (106 objects) | 6 | 8 | no | Virtual machine VSCSI read IOPS. |
+
+**Gap / risk**
+
+* Observed. `virtual-disk` carries only normalized-IOPS and limit metrics; latency per disk is on `vscsi`.
+
+**Open question -- where else the data might come from** (not asserted to exist): None.
+
+
+**Group F -- Further areas found in the vendored vSAN Management API**
+
+### 11.43 Performance Service self-health and stats object
+
+*Term search* `stats object|perf service` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cluster-domclient` (8), `host-domclient` (11)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `^VsanPerf[A-Z]`: `VsanFileServiceSystem.VsanPerformFileServiceEnablePreflightCheck`, `VsanPerformanceManager.VsanPerfCreateStatsObject`, `VsanPerformanceManager.VsanPerfCreateStatsObjectTask`, `VsanPerformanceManager.VsanPerfDeleteStatsObject`, `VsanPerformanceManager.VsanPerfDeleteStatsObjectTask`, `VsanPerformanceManager.VsanPerfDeleteTimeRange`, `VsanPerformanceManager.VsanPerfDiagnose`, `VsanPerformanceManager.VsanPerfDiagnoseTask`, `VsanPerformanceManager.VsanPerfGetAggregatedEntityTypes`, `VsanPerformanceManager.VsanPerfGetSupportedDiagnosticExceptions`, `VsanPerformanceManager.VsanPerfGetSupportedEntityTypes`, `VsanPerformanceManager.VsanPerfQueryClusterHealth`, `VsanPerformanceManager.VsanPerfQueryNodeInformation` (**used by the pack**), `VsanPerformanceManager.VsanPerfQueryPerf` (**used by the pack**), `VsanPerformanceManager.VsanPerfQueryStatsObjectInformation`, `VsanPerformanceManager.VsanPerfQueryTimeRanges`, `VsanPerformanceManager.VsanPerfSaveTimeRanges`, `VsanPerformanceManager.VsanPerfSetStatsObjectPolicy`, `VsanPerformanceManager.VsanPerfToggleVerboseMode`, `VsanPhoneHomeSystem.VsanPerformOnlineHealthCheck`, `VsanResourceCheckSystem.VsanPerformResourceCheck`
+
+**No Performance Service entity type in the captured schema covers this.**
+
+**Gap / risk**
+
+* The pack queries data but never the service's own state (stats object health, verbose mode, time ranges). What a collection returns when the stats object is unhealthy is not recorded here.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanPerfQueryClusterHealth`, `VsanPerfQueryStatsObjectInformation`, `VsanPerfGetAggregatedEntityTypes` (vendored, unused). The last may list entity types beyond `VsanPerfGetSupportedEntityTypes` -- unknown.
+
+
+### 11.44 HCL, firmware and controller compliance
+
+*Term search* `\bhcl\b|firmware|driver` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `cache-disk` (8), `capacity-disk` (8), `vsan-esa-disk-scsifw` (8)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 0
+* vendored vSAN Management API methods matching `Hcl|Firmware|Release`: `HostVsanHealthSystem.VsanFlashScsiControllerFirmware_Task`, `HostVsanHealthSystem.VsanGetHclInfo`, `VsanClusterHealthSystem.VsanClusterGetHclInfo`, `VsanVcClusterHealthSystem.VsanDownloadHclFile_Task`, `VsanVcClusterHealthSystem.VsanGetHclConstraints`, `VsanVcClusterHealthSystem.VsanGetReleaseRecommendation`, `VsanVcClusterHealthSystem.VsanPurgeHclFiles`, `VsanVcClusterHealthSystem.VsanVcClusterGetHclInfo`, `VsanVcClusterHealthSystem.VsanVcUpdateHclDbFromWeb`, `VsanVcClusterHealthSystem.VsanVcUploadHclDb`, `VsanVumSystem.VsanHostUpdateFirmware`, `VsanVumSystem.VsanVcUploadReleaseDb`
+
+**No Performance Service entity type in the captured schema covers this.**
+
+**Gap / risk**
+
+* Partly used: controller driver versions come from the `hclInfo` field of the cluster health summary (disk-hardware properties, section 5). A comment in `app/perfsvc.py` records that `GetClusterHclInfo` returns nothing until the HCL check is RUN (an action), so it is avoided. No HCL compliance status is pushed.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanVcClusterGetHclInfo` and friends (vendored).
+
+
+### 11.45 Cluster limits (component counts vs maximums)
+
+*Term search* `\blimit|maxComponents|compCnt` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `clom-disk` (3), `clom-host` (2), `remote-virtual-disk` (3), `virtual-disk` (3)
+* model ids NOT advertised by the schema: no hits
+* HCIBench ids not in our model: 3 -- `maxComponents`, `timesOverWindowLimitRead`, `timesOverWindowLimitWrite`
+* vendored vSAN Management API methods matching `Limits`: `HostVsanHealthSystem.VsanHostQueryCheckLimits`, `VsanClusterHealthSystem.VsanQueryClusterCheckLimits`
+
+| Entity type | Relation | Why related | Target and cptvsan group | Model | Status | Schema metrics | Modelled metrics | Feature-gated | Schema description (first metric) |
+|---|---|---|---|---|---|---|---|---|---|
+| `clom-host` | direct | schema text: node component count ratio | HostSystem `cptvsan\|Placement\|CLOM` | provisional | modelled, never observed (keys unverified) | 2 | 2 | no | Node component count ratio on this ESXi host. |
+| `clom-disk` | direct | schema text: disk component count ratio | HostSystem `cptvsan\|Placement\|CLOM Disk:{disk_uuid}` | provisional | modelled, never observed (keys unverified) | 3 | 3 | no | Disk component count ratio on this ESXi host. |
+
+**Gap / risk**
+
+* Both CLOM ratio types are never observed.
+
+**Open question -- where else the data might come from** (not asserted to exist): `VsanQueryClusterCheckLimits`, `VsanHostQueryCheckLimits` (vendored).
+
+
+### 11.46 Observability / logs
+
+*Term search* `\blogs?\b|trace|syslog|observer` (case-insensitive; raw hits, relevance is judged in the tables, not by the hit):
+
+* schema text (entity name, metric id, name, description): `ddh-disk` (1)
+* model ids NOT advertised by the schema: `vsan-memory`: `vsanobserverConsumedSize`, `vsantracedConsumedSize`, `vsanobserverReservedSize`, `vsantracedReservedSize`, `vsanobserverMemAllocMin`, `vsantracedMemAllocMin`, ... (+2 more)
+* HCIBench ids not in our model: 22 -- `bypassWritePercent`, `ioSizeTxnDelExtMiddleTreeLog`, `ioSizeTxnSnapDelMetaUpdateLog`, `ioSizeTxnSnapDeleteLog`, `llogCurrentSegNo`, `llogStartSegNo`, `plogCurrentSegNo`, `plogNumCommitLogs`, `plogNumFreedCommitLogs`, `plogNumFreedLogs`, ... (+12 more)
+* vendored vSAN Management API methods matching `Log|Bundle|Pcap|Telemetry`: `VsanClusterHealthSystem.VsanQueryClusterCaptureVsanPcap`, `VsanVcClusterHealthSystem.VsanAttachVsanSupportBundleToSr`, `VsanVcClusterHealthSystem.VsanHealthSendVsanTelemetry`, `VsanVcClusterHealthSystem.VsanHealthSetLogLevel`, `VsanVcClusterHealthSystem.VsanHealthSetVsanClusterTelemetryConfig`, `VsanVcClusterHealthSystem.VsanHealthTestVsanClusterTelemetryProxy`
+
+**No Performance Service entity type in the captured schema covers this.** Related metrics exist inside broader entity types (metric-level table below).
+
+Metric-level coverage inside broader entity types (`Actual` twins excluded):
+
+| Entity type | Status | Matching metrics | Advertised | Model-only | Metrics | Relation |
+|---|---|---|---|---|---|---|
+| `vsan-memory` | observed (4 objects) | 8 | 0 | 8 | `vsanobserverConsumedSize`, `vsantracedConsumedSize`, `vsanobserverReservedSize`, `vsantracedReservedSize`, `vsanobserverMemAllocMin`, `vsantracedMemAllocMin`, `vsanobserverMemAllocMax`, `vsantracedMemAllocMax` | memory of the vSAN trace / observer daemons |
+
+**Gap / risk**
+
+* The captured schema carries no log or event data. Schema hits for "log" are the DDH log-congestion metric and network packet text; HCIBench hits are zDOM write-log internals (plog/llog).
+* This pack itself emits only its own adapter log and the `Collector|lastUpdated` freshness key.
+
+**Open question -- where else the data might come from** (not asserted to exist): Logs belong to a log platform (syslog / log insight), not to this pack.
+
+### 11.47 Summary matrix
+
+Counts are computed. "Schema has types" counts DIRECT relations only;
+inferred relations are in parentheses. "Metric-level" counts matching metric
+ids inside broader types (the per-area metric table).
+
+| Area | Schema has types | Modelled (TREE) | Observed with data | Schema types not modelled | Metric-level | Gap |
+|---|---|---|---|---|---|---|
+| 11.1 vSAN File Services (NFS / SMB file shares) | 1 | 1/1 | 0/1 | 0 | - | aggregate only; no per-share/protocol; identity inferred |
+| 11.2 RWX volumes (ReadWriteMany: CNS file volumes on vSAN File Services) and CNS / Kubernetes persistent volumes | **none** (+2 inferred) | - | - | 0 | - | no PV-level data; join to CNS not built |
+| 11.3 HCI Mesh / remote datastores / compute-only clusters (client and server side) | 7 | 7/7 | 0/7 | 0 | - | all inferred; client/server attribution unproven (4.4) |
+| 11.4 vSAN Max / disaggregated storage clusters | **none** (+4 inferred) | - | - | 0 | - | no named type; relies on unverified remote types |
+| 11.5 Stretched clusters and the witness host | **none** (+2 inferred) | - | - | 0 | - | no type; docstring contradiction; no site dimension |
+| 11.6 iSCSI target service | 3 | 3/3 | 0/3 | 0 | - | never observed; identity inferred; ownership moves |
+| 11.7 NVMe-oF / NVMe-TCP | **none** | - | - | 0 | - | no type, no API name |
+| 11.8 Fibre Channel | **none** | - | - | 0 | 3 (1 on observed types) | out of scope; HBA wording only |
+| 11.9 vSAN Direct | 2 | 2/2 | 0/2 | 0 | - | never observed; cluster type lands on host |
+| 11.10 PMEM (persistent memory datastores) | 2 | 2/2 | 0/2 | 0 | - | never observed; ns-vs-µs unit risk |
+| 11.11 Object storage service (S3-compatible / vSAN Data Persistence platform) | **none** (+1 inferred) | - | - | 0 | - | no type, no API name |
+| 11.12 IOInsight | 1 | 1/1 | 0/1 | 0 | - | per-VMDK data keyed per host: collision/loss |
+| 11.13 vSAN objects (storage sense: DOM objects and components) | 9 (+1 inferred) | 9/9 | 8/9 | 0 | - | aggregates only; no per-object key |
+| 11.14 Object health and durability components | **none** | - | - | 0 | 15 (15 on observed types) | no health state; recovery-write proxy only |
+| 11.15 Abandoned / orphaned / inaccessible objects | **none** | - | - | 0 | - | no type; API names exist |
+| 11.16 VM swap objects and VM home namespace objects | **none** | - | - | 0 | 12 (12 on observed types) | class-level queues only |
+| 11.17 First Class Disks (FCD / Improved Virtual Disks) | **none** (+2 inferred) | - | - | 0 | - | unattached FCD unmappable |
+| 11.18 Independent disks (persistent / nonpersistent) | **none** (+1 inferred) | - | - | 0 | - | mode invisible; redo path may not resolve |
+| 11.19 Multi-writer disks | **none** (+1 inferred) | - | - | 0 | - | shared path lands on one VM |
+| 11.20 Storage policy (SPBM) compliance and per-policy capacity | 1 | 1/1 | 0/1 | 0 | 14 (1 on observed types) | resync reason + IOPS limit only |
+| 11.21 ESA adaptive RAID-5/6 and erasure coding | **none** | - | - | 0 | 10 (10 on observed types) | EC-named ids only; no layout |
+| 11.22 Thin provisioning and capacity reservations (operations reserve, host rebuild reserve) | 1 | 1/1 | 1/1 | 0 | - | no reserve / provisioned figures |
+| 11.23 TRIM / UNMAP and space reclamation | **none** | - | - | 0 | 94 (85 on observed types) | IO covered; reclaimed bytes absent |
+| 11.24 Deduplication and compression (OSA dedup & compression, ESA global dedup) | 11 | 11/11 | 1/11 | 0 | - | ESA dedup never observed; no compression metric |
+| 11.25 Snapshots and delta disks | 1 (+1 inferred) | 1/1 | 1/1 | 0 | 34 (30 on observed types) | one capacity number; no per-VM |
+| 11.26 Linked clones | **none** | - | - | 0 | - | no type; shared base misattributed (inference) |
+| 11.27 Resync / repair | 2 | 2/2 | 0/2 | 0 | 145 (145 on observed types) | IO covered; per-reason type silent; no ETA |
+| 11.28 Proactive rebalancing | 1 | 1/1 | 0/1 | 0 | 12 (0 on observed types) | reason only; never observed |
+| 11.29 Cluster shutdown / maintenance-mode data evacuation | 1 | 1/1 | 0/1 | 0 | 14 (2 on observed types) | decom IO only; no state |
+| 11.30 Health checks | **none** | - | - | 0 | - | not in perfsvc; API used only for disk props |
+| 11.31 Device health / SMART (and `ddh-disk`) | 1 | 1/1 | 0/1 | 0 | - | no SMART; ddh-disk silent |
+| 11.32 Controller / HBA queue depth and NVMe device latency | 3 | 3/3 | 1/3 | 0 | 12 (12 on observed types) | device latency covered; no adapter queue |
+| 11.33 Encryption (data at rest) | **none** | - | - | 0 | - | no type; state elsewhere |
+| 11.34 Data-in-transit encryption | **none** | - | - | 0 | - | no type, no API name |
+| 11.35 Data protection (vSAN data protection / snapshot service) | 1 | 1/1 | 1/1 | 0 | 1 (1 on observed types) | capacity only |
+| 11.36 RDMA / RoCE networking | **none** | - | - | 0 | 4 (4 on observed types) | PFC count only; no RDMA counters |
+| 11.37 Network diagnostics (TCP/IP, pNIC, vmknic, RDT, CMMDS) | 9 | 9/9 | 9/9 | 0 | - | covered; no per-peer latency |
+| 11.38 Placement and cluster membership (CLOM, CMMDS, distribution) | 4 | 4/4 | 0/4 | 0 | - | never observed |
+| 11.39 vSAN CPU and memory (worlds, heaps, slabs) | 8 | 8/8 | 5/8 | 0 | - | heap/slab/LSOM silent |
+| 11.40 ESA log-structured object layer (zDOM, VTX) | 3 | 3/3 | 3/3 | 0 | - | covered; more ids charted by HCIBench |
+| 11.41 Disk layers (ESA disks, OSA disk groups / cache / capacity) | 5 | 5/5 | 2/5 | 0 | - | OSA unverified |
+| 11.42 VM, virtual disk and vSCSI | 3 | 3/3 | 3/3 | 0 | - | covered |
+| 11.43 Performance Service self-health and stats object | **none** | - | - | 0 | - | service state not read |
+| 11.44 HCL, firmware and controller compliance | **none** | - | - | 0 | - | partial (disk properties) |
+| 11.45 Cluster limits (component counts vs maximums) | 2 | 2/2 | 0/2 | 0 | - | never observed |
+| 11.46 Observability / logs | **none** | - | - | 0 | 8 (8 on observed types) | out of scope |
+
+Modelled entity types not attributed to any area above (0):
+none.
