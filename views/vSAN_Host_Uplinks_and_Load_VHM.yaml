@@ -1,0 +1,47 @@
+id: 84de6a1e-aa7c-5da9-a0d5-a5cb31a72cbd
+name: vSAN Host Uplinks and Load [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: net|errorsRx_summation
+  display_name: Uplink RX Errors, All NICs
+  transformation: MAX
+- attribute: net|droppedRx_summation
+  display_name: Uplink RX Dropped, All NICs
+  transformation: MAX
+- attribute: net|errorsTx_summation
+  display_name: Uplink TX Errors, All NICs
+  transformation: MAX
+- attribute: net|droppedTx_summation
+  display_name: Uplink TX Dropped, All NICs
+  transformation: MAX
+- attribute: net|usage_average
+  display_name: Host Network Throughput
+  transformation: MAX
+- attribute: cpu|usage_average
+  display_name: Host CPU Usage
+  transformation: MAX
+- attribute: cpu|capacity_contentionPct
+  display_name: Host CPU Contention
+  transformation: MAX
+- attribute: mem|host_usagePct
+  display_name: Host Memory Consumed
+  transformation: MAX
+- attribute: mem|swapinRate_average
+  display_name: Host Memory Swap-In Rate
+  transformation: MAX
+- attribute: sys|uptime_latest
+  display_name: Host Uptime
+- attribute: Sensor|status
+  display_name: Hardware Sensor Status
+  transformation: MIN
+- attribute: vcfHealth|connectivity|criticalCount
+  display_name: Connectivity Issues, Critical
+  transformation: MAX
+- attribute: vcfHealth|utilization|criticalCount
+  display_name: Utilisation Issues, Critical
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

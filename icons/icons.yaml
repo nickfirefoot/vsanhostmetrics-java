@@ -1,0 +1,6 @@
+# Icon per describe.xml kind for vSAN Host Metrics. The builder resolves file
+# names here first, then in its shared icon library.
+adapter_kind_icon: default.svg
+
+resource_kinds:
+  vsanhostmetrics: default.svg

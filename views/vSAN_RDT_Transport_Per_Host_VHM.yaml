@@ -1,0 +1,40 @@
+id: c51f5531-ccea-543d-9a73-0e0d5e359d1a
+name: vSAN RDT Transport Per Host [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Network|Host|txCtxQMax
+  display_name: Max Out Context Bytes (B)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|avgLatency
+  display_name: Host Avg Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|maxLatency
+  display_name: Host Max Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|minLatency
+  display_name: Host Min Lat (μs)
+  transformation: MIN
+- attribute: cptvsan|Network|Host|txQLatAvg
+  display_name: Avg Out Queueing Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|txQLatMax
+  display_name: Max Out Queueing Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|txSbSpaceMin
+  display_name: Socket Min Out Bytes (Low Is Bad) (B)
+  transformation: MIN
+- attribute: cptvsan|Network|Host|rxSbSpaceMin
+  display_name: Socket Min In Bytes (Low Is Bad) (B)
+  transformation: MIN
+- attribute: cptvsan|Network|Host|rxSbSpaceMax
+  display_name: Socket Max In Bytes (B)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|kaReset
+  display_name: Keepalive reset (Total)
+- attribute: cptvsan|Network|Host|numReadyDelay
+  display_name: Num ready delay (Total)
+time_window:
+  unit: DAYS
+  count: 7

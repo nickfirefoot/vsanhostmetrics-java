@@ -1,0 +1,47 @@
+id: 74e1354d-757f-5ca7-a9e4-25e01718c627
+name: vSAN ESA Disks [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- instanced_group:
+    name: GROUP_cptvsan
+  display_name: Disk UUID
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: avgLatReadCapacity
+    sample_instance: "*"
+  display_name: vSAN Layer Avg Read Lat
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: avgLatWriteCapacity
+    sample_instance: "*"
+  display_name: vSAN Layer Avg Write Lat
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: avgLatWritePerf
+    sample_instance: "*"
+  display_name: Perf Tier Avg Write Lat
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: iopsReadCapacity
+    sample_instance: "*"
+  display_name: vSAN Layer Read IOPS
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: iopsWriteCapacity
+    sample_instance: "*"
+  display_name: vSAN Layer Write IOPS
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

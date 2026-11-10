@@ -1,0 +1,79 @@
+id: 4edb922b-10e6-5f18-b0d8-77cdba6df121
+name: vSAN ESA Disk Physical Layer [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- instanced_group:
+    name: GROUP_cptvsan
+  display_name: Disk UUID
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: model
+    sample_instance: "*"
+  display_name: Model
+  is_property: true
+  is_string_attribute: true
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: firmware
+    sample_instance: "*"
+  display_name: Firmware
+  is_property: true
+  is_string_attribute: true
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: driver
+    sample_instance: "*"
+  display_name: Driver
+  is_property: true
+  is_string_attribute: true
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: driver_version
+    sample_instance: "*"
+  display_name: Driver Version
+  is_property: true
+  is_string_attribute: true
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: latencyDevRead
+    sample_instance: "*"
+  display_name: Read Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: latencyDevWrite
+    sample_instance: "*"
+  display_name: Write Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: latencyDevDAvg
+    sample_instance: "*"
+  display_name: Device Avg Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: latencyDevKAvg
+    sample_instance: "*"
+  display_name: Kernel Avg Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Disk
+    suffix: latencyDevGAvg
+    sample_instance: "*"
+  display_name: Guest Avg Lat (μs)
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

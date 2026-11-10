@@ -1,0 +1,56 @@
+id: 0720927f-2468-5902-b157-5fe3fcda3b7c
+name: vSAN Host DOM Owner [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Storage I/O:dom-owner|segCleanerUnmapCongestion
+  display_name: Seg clean unmap congestion
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|recoveryWriteCongestion
+  display_name: Resync Read Congestions
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyAvgWrite
+  display_name: Write Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyMaxWrite
+  display_name: Lat (max, write) (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyStddevWrite
+  display_name: Lat stddev (write) (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyAvgRead
+  display_name: Read Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyMaxRead
+  display_name: Lat (max, read) (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|highOIODurationPercentWrite
+  display_name: High outstanding IO duration % (write)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|owner2PCCommitLatencyAvgUs
+  display_name: Owner2 pc commit latency avg (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|writeLeafOwnerLatencyLocal
+  display_name: Write leaf owner latency local (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|writeLeafOwnerLatencyRemote
+  display_name: Write leaf owner latency remote (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|readLeafOwnerLatencyLocal
+  display_name: Read leaf owner latency local (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|readLeafOwnerLatencyRemote
+  display_name: Read leaf owner latency remote (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|serverSwitchCount
+  display_name: Server switch count
+- attribute: cptvsan|Storage I/O:dom-owner|iops
+  display_name: IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|oio
+  display_name: OIO
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

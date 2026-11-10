@@ -1,0 +1,94 @@
+id: c10ec3f1-e693-5b3d-af81-d2d19de1c341
+name: vSAN Host TCP Health [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- instanced_group:
+    name: GROUP_cptvsan
+  display_name: TCP/IP Stack
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpTxRexmitRate
+    sample_instance: "*"
+  display_name: TCP TX retransmit (rate)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpRxErrRate
+    sample_instance: "*"
+  display_name: TCP RX errors (rate)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpRcvdupackRate
+    sample_instance: "*"
+  display_name: Received Duplicate Acknowledge Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpRcvduppackRate
+    sample_instance: "*"
+  display_name: Received Duplicate Packets Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpRcvoopackRate
+    sample_instance: "*"
+  display_name: Received Out-of-order Packets Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpSackRcvBlocksRate
+    sample_instance: "*"
+  display_name: Sack Received Blocks Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpSackSendBlocksRate
+    sample_instance: "*"
+  display_name: Sack Send Blocks Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpSackRexmitsRate
+    sample_instance: "*"
+  display_name: Sack Rexmits Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpTimeoutDropRate
+    sample_instance: "*"
+  display_name: Timeout Drop Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpHalfopenDropRate
+    sample_instance: "*"
+  display_name: Half Open Drop Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpSndZeroWin
+    sample_instance: "*"
+  display_name: TCP Send Zero Window (Total)
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|TCP/IP Stack
+    suffix: tcpErrs
+    sample_instance: "*"
+  display_name: TCP Errors (Total) (%)
+time_window:
+  unit: DAYS
+  count: 7

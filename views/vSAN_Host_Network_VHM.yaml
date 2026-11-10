@@ -1,0 +1,33 @@
+id: d46f58a8-e3a4-519f-9124-ac8ff83871c5
+name: vSAN Host Network [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Network|Host|rxPacketsLossRate
+  display_name: Network In Packet Discard Rate (%)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|txPacketsLossRate
+  display_name: Network Out Packet Discard Rate (%)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|portRxDrops
+  display_name: In Packet Drop Rate (host port) (%)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|portTxDrops
+  display_name: Out Packet Drop Rate (host port) (%)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|rxThroughput
+  display_name: Network In Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|txThroughput
+  display_name: Network Out Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|rxPackets
+  display_name: Network In Packets Per Second
+  transformation: MAX
+- attribute: cptvsan|Network|Host|txPackets
+  display_name: Network Out Packets Per Second
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

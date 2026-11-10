@@ -1,0 +1,127 @@
+id: 09f4cb2e-f52c-412a-826d-ee04a3d07d0f
+name: vSAN pNIC Errors [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- instanced_group:
+    name: GROUP_cptvsan
+  display_name: Physical NIC
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxMissErr
+    sample_instance: "*"
+  display_name: pNIC RX Missed Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxCrcErr
+    sample_instance: "*"
+  display_name: pNIC RX CRC Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxErr
+    sample_instance: "*"
+  display_name: pNIC RX Generic Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxFifoErr
+    sample_instance: "*"
+  display_name: pNIC RX FIFO Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxOvErr
+    sample_instance: "*"
+  display_name: pNIC RX Buffer Overflow Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: txCarErr
+    sample_instance: "*"
+  display_name: pNIC TX Carrier Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: txErr
+    sample_instance: "*"
+  display_name: pNIC TX Generic Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: portRxDrops
+    sample_instance: "*"
+  display_name: In Packet Drop Rate (pNIC port) (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: portTxDrops
+    sample_instance: "*"
+  display_name: Out Packet Drop Rate (pNIC port) (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: pauseCount
+    sample_instance: "*"
+  display_name: pNic 802.3x Pause Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: ioChainDrops
+    sample_instance: "*"
+  display_name: IO chain drops
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: ioChainRxdrops
+    sample_instance: "*"
+  display_name: IO chain RX drops
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: ioChainTxdrops
+    sample_instance: "*"
+  display_name: IO chain TX drops
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxMissErrRaw
+    sample_instance: "*"
+  display_name: pNIC RX Missed Error (Total)
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxCrcErrRaw
+    sample_instance: "*"
+  display_name: pNIC RX CRC Error (Total)
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: pfcCountRaw
+    sample_instance: "*"
+  display_name: pNIC PFC Count (Total)
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: portTxpkts
+    sample_instance: "*"
+  display_name: Port TX packets (Total)
+time_window:
+  unit: DAYS
+  count: 7

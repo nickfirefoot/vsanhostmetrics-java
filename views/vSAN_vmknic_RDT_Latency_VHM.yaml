@@ -1,0 +1,80 @@
+id: feb4ebf1-534e-5ef4-9bbe-16433d9b783a
+name: vSAN vmknic RDT Latency [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- instanced_group:
+    name: GROUP_cptvsan
+  display_name: VMkernel NIC
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: txCtxQMax
+    sample_instance: "*"
+  display_name: Max Out Context Bytes (B)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: avgLatency
+    sample_instance: "*"
+  display_name: VNIC Avg Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: maxLatency
+    sample_instance: "*"
+  display_name: Cluster Max Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: minLatency
+    sample_instance: "*"
+  display_name: Cluster Min Lat (μs)
+  transformation: MIN
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: txQLatAvg
+    sample_instance: "*"
+  display_name: Avg Out Queueing Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: txQLatMax
+    sample_instance: "*"
+  display_name: Max Out Queueing Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: txSbSpaceMin
+    sample_instance: "*"
+  display_name: Socket Min Out Bytes (Low Is Bad) (B)
+  transformation: MIN
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: rxSbSpaceMin
+    sample_instance: "*"
+  display_name: Socket Min In Bytes (Low Is Bad) (B)
+  transformation: MIN
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: kaReset
+    sample_instance: "*"
+  display_name: Keepalive reset (Total)
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: numReadyDelay
+    sample_instance: "*"
+  display_name: Num ready delay (Total)
+time_window:
+  unit: DAYS
+  count: 7

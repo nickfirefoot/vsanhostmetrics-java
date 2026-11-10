@@ -1,0 +1,27 @@
+id: b597d3fd-2fbb-546e-88f8-3f6d42537dcf
+name: vSAN Cluster DOM Component Manager [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: ClusterComputeResource
+columns:
+- attribute: cptvsan|Storage I/O:dom-compmgr|latencyAvgRead
+  display_name: Read Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|latencyAvgWrite
+  display_name: Write Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|congestion
+  display_name: Congestions
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|oio
+  display_name: OIO
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|iopsRead
+  display_name: Read IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|iopsWrite
+  display_name: Write IOPS
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

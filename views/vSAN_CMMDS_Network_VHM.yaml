@@ -1,0 +1,39 @@
+id: 1d4ec589-2f11-5ff5-a0d3-bddbf2a319fc
+name: vSAN CMMDS Network [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Network|Host|rdtTx
+  display_name: Read Out
+  transformation: MAX
+- attribute: cptvsan|Network|Host|rdtRx
+  display_name: Read In
+  transformation: MAX
+- attribute: cptvsan|Network|Host|rdtTxThroughput
+  display_name: Read Out Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|rdtRxThroughput
+  display_name: Read In Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|groupTxUcast
+  display_name: Group Out Unicast
+  transformation: MAX
+- attribute: cptvsan|Network|Host|groupRx
+  display_name: Group In
+  transformation: MAX
+- attribute: cptvsan|Network|Host|groupTxUcastThroughput
+  display_name: Group Out Unicast Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|groupRxThroughput
+  display_name: Group In Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Network|Host|groupTxMcast
+  display_name: Group Out Multicast
+  transformation: MAX
+- attribute: cptvsan|Network|Host|groupTxMcastThroughput
+  display_name: Group Out Multicast Throughput (B/s)
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

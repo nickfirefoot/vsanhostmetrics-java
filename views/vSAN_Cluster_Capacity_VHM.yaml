@@ -1,0 +1,19 @@
+id: 80f0f637-d7a6-5252-aaba-6c9d04772960
+name: vSAN Cluster Capacity [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: ClusterComputeResource
+columns:
+- attribute: cptvsan|Capacity|free
+  display_name: Free Capacity (B)
+- attribute: cptvsan|Capacity|used
+  display_name: Used Capacity (B)
+- attribute: cptvsan|Capacity|total
+  display_name: Total Capacity (B)
+- attribute: cptvsan|Capacity|dedupRatio
+  display_name: Space Efficiency Ratio (100 = 1.00x)
+- attribute: cptvsan|Capacity|savedByDedup
+  display_name: Saved Capacity (B)
+time_window:
+  unit: DAYS
+  count: 7

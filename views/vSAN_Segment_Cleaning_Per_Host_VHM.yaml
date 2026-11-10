@@ -1,0 +1,38 @@
+id: 8c9cf5f4-f8c8-5ea6-9f3f-a9aaa4992029
+name: vSAN Segment Cleaning Per Host [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Storage I/O:dom-owner|iopsSegCleanerUnmap
+  display_name: IOPS seg cleaner unmap
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyAvgSegCleanerUnmap
+  display_name: Lat avg seg cleaner unmap (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyMaxSegCleanerUnmap
+  display_name: Lat max seg cleaner unmap (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyStddevSegCleanerUnmap
+  display_name: Lat stddev seg cleaner unmap (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|throughputSegCleanerUnmap
+  display_name: Throughput seg cleaner unmap (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|segCleanerUnmapLeafOwnerMaxLatencyAvgUs
+  display_name: Seg clean unmap leaf owner max lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|iopsUnmap
+  display_name: Unmap IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyAvgUnmap
+  display_name: Unmap Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyMaxUnmap
+  display_name: Lat max unmap (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|unmapCount
+  display_name: Unmap count
+time_window:
+  unit: DAYS
+  count: 7

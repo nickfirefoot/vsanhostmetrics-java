@@ -1,0 +1,41 @@
+id: fd0dec19-eb82-57eb-85f4-bba2dd495e78
+name: vSAN Host Memory [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Memory:vsan|kernelConsumedSize
+  display_name: Kernel consumed size
+  transformation: MAX
+- attribute: cptvsan|Memory:vsan|kernelReservedSize
+  display_name: Kernel Reserved Memory Size (B)
+- attribute: cptvsan|Memory:vsan|uwConsumedSize
+  display_name: Uw consumed size (B)
+  transformation: MAX
+- attribute: cptvsan|Memory:vsan|uwReservedSize
+  display_name: User world Reserved Memory Size (B)
+- attribute: cptvsan|Memory:vsan|clomdConsumedSize
+  display_name: Clomd consumed size (B)
+  transformation: MAX
+- attribute: cptvsan|Memory:vsan|clomdReservedSize
+  display_name: Clomd reserved size (B)
+- attribute: cptvsan|Memory:vsan|cmmdsdConsumedSize
+  display_name: Cmmdsd consumed size (B)
+  transformation: MAX
+- attribute: cptvsan|Memory:vsan|cmmdsdReservedSize
+  display_name: Cmmdsd reserved size (B)
+- attribute: cptvsan|Memory:vsan|vsanmgmtdConsumedSize
+  display_name: Vsanmgmtd consumed size (B)
+  transformation: MAX
+- attribute: cptvsan|Memory:vsan|epdConsumedSize
+  display_name: Epd consumed size (B)
+  transformation: MAX
+- attribute: cptvsan|Memory:vsan|osfsdConsumedSize
+  display_name: Osfsd consumed size (B)
+  transformation: MAX
+- attribute: cptvsan|Memory:vsan|vsandevicemonitordConsumedSize
+  display_name: Vsandevicemonitord consumed size (B)
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

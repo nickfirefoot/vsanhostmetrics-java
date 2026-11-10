@@ -1,0 +1,74 @@
+id: e70e6f0e-028b-5f87-8d1c-a37f076b8a5e
+name: vSAN High pNIC Error Rate [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- instanced_group:
+    name: GROUP_cptvsan
+  display_name: Physical NIC
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxCrcErr
+    sample_instance: "*"
+  display_name: pNIC RX CRC Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxErr
+    sample_instance: "*"
+  display_name: pNIC RX Generic Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxFifoErr
+    sample_instance: "*"
+  display_name: pNIC RX FIFO Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxMissErr
+    sample_instance: "*"
+  display_name: pNIC RX Missed Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxOvErr
+    sample_instance: "*"
+  display_name: pNIC RX Buffer Overflow Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: txCarErr
+    sample_instance: "*"
+  display_name: pNIC TX Carrier Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: txErr
+    sample_instance: "*"
+  display_name: pNIC TX Generic Error (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: pauseCount
+    sample_instance: "*"
+  display_name: pNic 802.3x Pause Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|Physical NIC
+    suffix: rxMissErrRaw
+    sample_instance: "*"
+  display_name: pNIC RX Missed Error (Total)
+time_window:
+  unit: DAYS
+  count: 7

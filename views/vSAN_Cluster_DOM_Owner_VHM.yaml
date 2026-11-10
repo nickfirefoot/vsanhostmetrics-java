@@ -1,0 +1,39 @@
+id: 4d71fbcc-a7c2-5f19-8940-b1601efcb0d1
+name: vSAN Cluster DOM Owner [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: ClusterComputeResource
+columns:
+- attribute: cptvsan|Storage I/O:dom-owner|latencyAvgRead
+  display_name: Read Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|latencyAvgWrite
+  display_name: Write Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|iopsRead
+  display_name: Read IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|iopsWrite
+  display_name: Write IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|tputRead
+  display_name: Read Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|tputWrite
+  display_name: Write Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|oio
+  display_name: OIO
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|congestion
+  display_name: Congestions
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|readCongestion
+  display_name: Read Congestions
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|writeCongestion
+  display_name: Write Congestions
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

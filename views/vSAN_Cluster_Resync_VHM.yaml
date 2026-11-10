@@ -1,0 +1,27 @@
+id: e12fcf23-eb55-5555-9bf9-b7c4c91d1135
+name: vSAN Cluster Resync [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: ClusterComputeResource
+columns:
+- attribute: cptvsan|Storage I/O:dom-compmgr|iopsResyncRead
+  display_name: Resync Read IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|tputResyncRead
+  display_name: Resync Read Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|latAvgResyncRead
+  display_name: Resync Read Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|iopsRecWrite
+  display_name: Recovery Write IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|throughputRecWrite
+  display_name: Recovery Write Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|latencyAvgRecWrite
+  display_name: Recovery Write Lat (μs)
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

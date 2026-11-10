@@ -1,0 +1,227 @@
+id: ba668641-8b47-5d41-8ac6-af6b7acb6265
+name: Rapid vSAN Host Resources
+shared: true
+widgets:
+- id: 7897534d-539f-5127-b209-506c6a271995
+  type: View
+  title: Select cluster
+  coords:
+    x: 1
+    y: 1
+    w: 2
+    h: 7
+  self_provider: true
+  pin:
+    adapter_kind: VMWARE
+    resource_kind: vSphere World
+  view: vSAN Clusters [VHM]
+- id: 06477a2e-a47d-55a9-8123-1d22b58862fe
+  type: View
+  title: vSAN daemon memory
+  coords:
+    x: 3
+    y: 1
+    w: 10
+    h: 7
+  view: vSAN Host Memory [VHM]
+  select_first_row: false
+- id: 8149f26c-4037-5321-b991-099a61856c23
+  type: View
+  title: vSAN CPU - is it starved?
+  coords:
+    x: 1
+    y: 8
+    w: 12
+    h: 7
+  view: vSAN Host CPU [VHM]
+  select_first_row: false
+- id: cb85b827-9612-52d0-b2f0-4711ac18b56b
+  type: View
+  title: Host network - all vSAN
+  coords:
+    x: 1
+    y: 15
+    w: 12
+    h: 7
+  view: vSAN Host Network [VHM]
+  select_first_row: false
+- id: 7790e754-c598-5a02-ab02-527d742a784f
+  type: TextDisplay
+  title: How to read this
+  coords:
+    x: 1
+    y: 22
+    w: 12
+    h: 7
+  html: '<div style="font-family:''Metropolis'',''Segoe UI'',sans-serif;font-size:13px;padding:12px
+    14px;background:#2b3137;color:#e9edf0;border:1px solid rgba(255,255,255,0.18);border-radius:6px">
+
+    <h2 style="font-size:15px;font-weight:700;margin:2px 0 10px 0;color:#e9edf0">Host
+    resources &mdash; what does vSAN itself consume on each host?</h2>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">This screen shows what
+    vSAN consumes on a host: the memory used by each vSAN daemon, vSAN''s CPU figures,
+    and vSAN''s network traffic aggregated per host. It does not show the host''s
+    total load, which vCenter reports in <b style="font-weight:700;color:#e9edf0">Host
+    health and load</b> on the Overview screen and <b style="font-weight:700;color:#e9edf0">Every
+    uplink - from vCenter</b> on the Network screen.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">The CPU table has one row
+    per host. It shows <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">readyPct</code>,
+    <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">usedPct</code>
+    and <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">runPct</code>
+    and the peak run and used percentages, as reported by the vSAN Performance Service.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">The memory table lists
+    the memory consumed and reserved by each vSAN daemon. It reports memory use, not
+    whether a daemon is responding.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">The network table is vSAN''s
+    traffic per host, where the Network screen shows the same counters per vmknic.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">Reading any column here</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#e9edf0">Where
+    the data lives.</b> This pack creates no objects of its own. Its vSAN figures
+    are metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan</code>
+    on vCenter''s own cluster, host and virtual machine objects, and each panel below
+    reaches them from the selected cluster through vCenter''s cluster, host and virtual
+    machine relationships.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#e9edf0">Units
+    are in the column heading.</b> A heading with no unit has no unit declared for
+    that metric.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#e9edf0">A
+    blank cell is not a zero.</b> A blank cell means no value was collected for that
+    column in the selected period.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#e9edf0">Raw
+    columns are cumulative counts.</b> Where a column has a Raw twin, the Raw column
+    is the cumulative count and the other column is a per-interval rate.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">vSAN daemon memory</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">Renders the <b style="font-weight:700;color:#e9edf0">vSAN
+    Host Memory</b> view. Metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan|Memory:vsan</code>
+    on the vCenter host object (HostSystem).</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Kernel
+    consumed size</span> &mdash; Memory in use by the vSAN kernel modules.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Kernel
+    Reserved Memory Size (B)</span> &mdash; Memory reserved for the vSAN kernel modules.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Uw
+    consumed size (B)</span> &mdash; Memory consumed by vSAN user-world processes
+    in total.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">User
+    world Reserved Memory Size (B)</span> &mdash; Memory reserved for vSAN user-world
+    processes.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Clomd
+    consumed size (B)</span> &mdash; Memory used by clomd, the cluster level object
+    manager daemon.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Clomd
+    reserved size (B)</span> &mdash; Memory reserved for clomd.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Cmmdsd
+    consumed size (B)</span> &mdash; Memory used by <b style="font-weight:700;color:#e9edf0">cmmdsd</b>,
+    the cluster directory service that maintains membership and object metadata.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Cmmdsd
+    reserved size (B)</span> &mdash; Memory reserved for cmmdsd.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Vsanmgmtd
+    consumed size (B)</span> &mdash; Memory used by vsanmgmtd, the vSAN management
+    daemon.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Epd
+    consumed size (B)</span> &mdash; Memory used by epd, a vSAN daemon.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Osfsd
+    consumed size (B)</span> &mdash; Memory used by osfsd, the object filesystem daemon.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Vsandevicemonitord
+    consumed size (B)</span> &mdash; Memory used by vsandevicemonitord, the vSAN device
+    monitor daemon.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">vSAN CPU - is it starved?</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">Renders the <b style="font-weight:700;color:#e9edf0">vSAN
+    Host CPU</b> view. Metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan|CPU:vsan</code>
+    on the vCenter host object (HostSystem).</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Percentage
+    of Ready CPU Time (%)</span> &mdash; Percentage of ready CPU time for vSAN''s
+    threads: time they were ready to run but had not been given a physical CPU. Reported
+    by the vSAN Performance Service.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Run
+    % (max)</span> &mdash; Highest running-CPU percentage for vSAN in the interval.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Percentage
+    of Used CPU Time (%)</span> &mdash; Percentage of used CPU time for vSAN, as reported
+    by the vSAN Performance Service.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Percentage
+    of Running CPU Time (%)</span> &mdash; Percentage of running CPU time for vSAN,
+    as reported by the vSAN Performance Service.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Used
+    % (max)</span> &mdash; Highest used-CPU percentage for vSAN in the interval.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">Host network - all vSAN</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">Renders the <b style="font-weight:700;color:#e9edf0">vSAN
+    Host Network</b> view. Metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan|Network|Host</code>
+    on the vCenter host object (HostSystem).</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Network
+    In Packet Discard Rate (%)</span> &mdash; Proportion of inbound packets discarded
+    at the host network layer, across all of this host''s vSAN traffic rather than
+    one uplink.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Network
+    Out Packet Discard Rate (%)</span> &mdash; Proportion of outbound packets discarded
+    at the host network layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">In
+    Packet Drop Rate (host port) (%)</span> &mdash; Inbound packets dropped by the
+    vSwitch for this port.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Out
+    Packet Drop Rate (host port) (%)</span> &mdash; The vSwitch discarded outbound
+    packets for this port.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Network
+    In Throughput (B/s)</span> &mdash; Inbound throughput for this host''s vSAN traffic.
+    Context for the error columns.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Network
+    Out Throughput (B/s)</span> &mdash; Outbound throughput for this host''s vSAN
+    traffic.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Network
+    In Packets Per Second</span> &mdash; Inbound packets per second.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Network
+    Out Packets Per Second</span> &mdash; Outbound packets per second.</p>
+
+    </div>'
+interactions:
+- from: 7897534d-539f-5127-b209-506c6a271995
+  to: 06477a2e-a47d-55a9-8123-1d22b58862fe
+  type: resourceId
+- from: 7897534d-539f-5127-b209-506c6a271995
+  to: 8149f26c-4037-5321-b991-099a61856c23
+  type: resourceId
+- from: 7897534d-539f-5127-b209-506c6a271995
+  to: cb85b827-9612-52d0-b2f0-4711ac18b56b
+  type: resourceId

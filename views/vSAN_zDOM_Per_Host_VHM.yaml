@@ -1,0 +1,42 @@
+id: 08f4845e-a550-569a-9596-b244075ac675
+name: vSAN zDOM Per Host [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|zDOM|latencyAvgRead
+  display_name: Read Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|zDOM|latencyAvgWrite
+  display_name: Write Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|zDOM|readLatencyMaxUs
+  display_name: Read latency max (μs)
+  transformation: MAX
+- attribute: cptvsan|zDOM|writeLatencyMaxUs
+  display_name: Write latency max (μs)
+  transformation: MAX
+- attribute: cptvsan|zDOM|unmapLatencyMaxUs
+  display_name: Unmap latency max (μs)
+  transformation: MAX
+- attribute: cptvsan|zDOM|iopsRead
+  display_name: Read IOPS
+  transformation: MAX
+- attribute: cptvsan|zDOM|iopsWrite
+  display_name: Write IOPS
+  transformation: MAX
+- attribute: cptvsan|zDOM|throughputRead
+  display_name: Read Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|zDOM|throughputWrite
+  display_name: Write Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|zDOM|oio
+  display_name: OIO
+  transformation: MAX
+- attribute: cptvsan|zDOM|oioWrite
+  display_name: OIO (write)
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

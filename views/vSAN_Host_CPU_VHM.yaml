@@ -1,0 +1,24 @@
+id: b874b70d-0372-5ae5-add1-6791a6327894
+name: vSAN Host CPU [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|CPU:vsan|readyPct
+  display_name: Percentage of Ready CPU Time (%)
+  transformation: MAX
+- attribute: cptvsan|CPU:vsan|maxRunPct
+  display_name: Run % (max)
+  transformation: MAX
+- attribute: cptvsan|CPU:vsan|usedPct
+  display_name: Percentage of Used CPU Time (%)
+  transformation: MAX
+- attribute: cptvsan|CPU:vsan|runPct
+  display_name: Percentage of Running CPU Time (%)
+  transformation: MAX
+- attribute: cptvsan|CPU:vsan|maxUsedPct
+  display_name: Used % (max)
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

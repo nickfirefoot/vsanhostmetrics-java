@@ -1,0 +1,374 @@
+id: 2bdcf123-db31-5e20-9c2f-c654b3a18e47
+name: Rapid vSAN DOM
+shared: true
+widgets:
+- id: ab2fd9ac-12e5-596c-b3df-19db870b511c
+  type: View
+  title: Select cluster
+  coords:
+    x: 1
+    y: 1
+    w: 2
+    h: 6
+  self_provider: true
+  pin:
+    adapter_kind: VMWARE
+    resource_kind: vSphere World
+  view: vSAN Clusters [VHM]
+- id: 28b2ca1c-4cf4-5d7f-9b8b-6fb8504f5282
+  type: View
+  title: Cluster - owner
+  coords:
+    x: 1
+    y: 8
+    w: 12
+    h: 6
+  view: vSAN Cluster DOM Owner [VHM]
+  select_first_row: false
+- id: 0d6665e3-696b-5f5a-9400-bb6a4c1e80e2
+  type: View
+  title: Cluster - component manager
+  coords:
+    x: 1
+    y: 14
+    w: 12
+    h: 6
+  view: vSAN Cluster DOM Component Manager [VHM]
+  select_first_row: false
+- id: dae3d599-046a-564b-99f3-4898af181a51
+  type: View
+  title: Per host - client
+  coords:
+    x: 1
+    y: 20
+    w: 12
+    h: 7
+  view: vSAN Host DOM [VHM]
+  select_first_row: false
+- id: ac9deec5-eb54-54fd-ac36-bc33151aead6
+  type: View
+  title: Per host - owner
+  coords:
+    x: 1
+    y: 27
+    w: 12
+    h: 8
+  view: vSAN Host DOM Owner [VHM]
+  select_first_row: false
+- id: 290259f5-70f8-5577-a235-24b71f533cdf
+  type: View
+  title: Per host - component manager
+  coords:
+    x: 1
+    y: 35
+    w: 12
+    h: 8
+  view: vSAN Host DOM Component Manager [VHM]
+  select_first_row: false
+- id: 068a18ab-9aca-5ce4-b458-17179f586c8f
+  type: TextDisplay
+  title: How to read this
+  coords:
+    x: 1
+    y: 43
+    w: 12
+    h: 7
+  html: '<div style="font-family:''Metropolis'',''Segoe UI'',sans-serif;font-size:13px;padding:12px
+    14px;background:#2b3137;color:#e9edf0;border:1px solid rgba(255,255,255,0.18);border-radius:6px">
+
+    <h2 style="font-size:15px;font-weight:700;margin:2px 0 10px 0;color:#e9edf0">DOM
+    &mdash; how is each layer of a vSAN write performing?</h2>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">DOM is the distributed
+    object manager, and it has three layers. The <b style="font-weight:700;color:#e9edf0">client</b>
+    is the host a guest is running on. The <b style="font-weight:700;color:#e9edf0">owner</b>
+    is the host that coordinates a given object''s writes, which may be a different
+    host entirely. The <b style="font-weight:700;color:#e9edf0">component manager</b>
+    is what talks to the disks.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">The same measures are reported
+    at each layer. This screen shows the owner and the component manager at cluster
+    level, and the client, the owner and the component manager for each host. The
+    cluster-level client table is on the Overview and Backpressure screens.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">Reading any column here</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#e9edf0">Where
+    the data lives.</b> This pack creates no objects of its own. Its vSAN figures
+    are metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan</code>
+    on vCenter''s own cluster, host and virtual machine objects, and each panel below
+    reaches them from the selected cluster through vCenter''s cluster, host and virtual
+    machine relationships.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#e9edf0">Units
+    are in the column heading.</b> A heading with no unit has no unit declared for
+    that metric.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#e9edf0">A
+    blank cell is not a zero.</b> A blank cell means no value was collected for that
+    column in the selected period.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#e9edf0">Raw
+    columns are cumulative counts.</b> Where a column has a Raw twin, the Raw column
+    is the cumulative count and the other column is a per-interval rate.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">Cluster - owner</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">Renders the <b style="font-weight:700;color:#e9edf0">vSAN
+    Cluster DOM Owner</b> view. Metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan|Storage
+    I/O:dom-owner</code> on the vCenter cluster object (ClusterComputeResource).</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    Lat (μs)</span> &mdash; Average read latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    Lat (μs)</span> &mdash; Average write latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    IOPS</span> &mdash; Read operations per second.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    IOPS</span> &mdash; Write operations per second.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    Throughput (B/s)</span> &mdash; Bytes per second read. The owner layer names its
+    throughput columns differently from the client layer; the quantity is the same.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    Throughput (B/s)</span> &mdash; Bytes per second written.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">OIO</span>
+    &mdash; Outstanding IO: operations issued and not yet completed. Latency multiplied
+    by nothing tells you why it is high -- this does. High latency with high outstanding
+    IO is queueing, high latency with low outstanding IO is a slow device.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Congestions</span>
+    &mdash; vSAN congestion raised at this layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    Congestions</span> &mdash; Backpressure attributed to reads.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    Congestions</span> &mdash; Backpressure attributed to writes.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">Cluster - component manager</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">Renders the <b style="font-weight:700;color:#e9edf0">vSAN
+    Cluster DOM Component Manager</b> view. Metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan|Storage
+    I/O:dom-compmgr</code> on the vCenter cluster object (ClusterComputeResource).</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    Lat (μs)</span> &mdash; Average read latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    Lat (μs)</span> &mdash; Average write latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Congestions</span>
+    &mdash; vSAN congestion raised at this layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">OIO</span>
+    &mdash; Outstanding IO: operations issued and not yet completed. Latency multiplied
+    by nothing tells you why it is high -- this does. High latency with high outstanding
+    IO is queueing, high latency with low outstanding IO is a slow device.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    IOPS</span> &mdash; Read operations per second.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    IOPS</span> &mdash; Write operations per second.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">Per host - client</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">Renders the <b style="font-weight:700;color:#e9edf0">vSAN
+    Host DOM</b> view. Metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan|Storage
+    I/O:dom-client</code> on the vCenter host object (HostSystem).</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    Lat (μs)</span> &mdash; Average read latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    Lat (μs)</span> &mdash; Average write latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Congestions</span>
+    &mdash; vSAN congestion raised at this layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    IOPS</span> &mdash; Read operations per second.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    IOPS</span> &mdash; Write operations per second.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">OIO</span>
+    &mdash; Outstanding IO: operations issued and not yet completed. Latency multiplied
+    by nothing tells you why it is high -- this does. High latency with high outstanding
+    IO is queueing, high latency with low outstanding IO is a slow device.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">Per host - owner</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">Renders the <b style="font-weight:700;color:#e9edf0">vSAN
+    Host DOM Owner</b> view. Metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan|Storage
+    I/O:dom-owner</code> on the vCenter host object (HostSystem).</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Seg
+    clean unmap congestion</span> &mdash; Congestion attributed to segment cleaner
+    unmap work.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Resync
+    Read Congestions</span> &mdash; Congestion reported under the id recoveryWriteCongestion.
+    The Performance Service publishes it under the name "Resync Read Congestions",
+    and the column label is that Broadcom name.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    Lat (μs)</span> &mdash; Average write latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Lat
+    (max, write) (μs)</span> &mdash; Worst write latency in the interval.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Lat
+    stddev (write) (μs)</span> &mdash; Standard deviation of write latency.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    Lat (μs)</span> &mdash; Average read latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Lat
+    (max, read) (μs)</span> &mdash; Worst read latency in the interval.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">High
+    outstanding IO duration % (write)</span> &mdash; High outstanding IO duration
+    for writes, as a percentage of the interval.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Owner2
+    pc commit latency avg (μs)</span> &mdash; Average latency, in microseconds, of
+    the owner''s 2PC (two-phase commit) of a write.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    leaf owner latency local (μs)</span> &mdash; Write latency for replicas on this
+    host.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    leaf owner latency remote (μs)</span> &mdash; Write latency for replicas on other
+    hosts.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    leaf owner latency local (μs)</span> &mdash; Read latency served from this host''s
+    own disks.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    leaf owner latency remote (μs)</span> &mdash; Read latency served from another
+    host''s disks.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Server
+    switch count</span> &mdash; Cumulative count of server switches.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">IOPS</span>
+    &mdash; Total operations per second at this layer, reads and writes together.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">OIO</span>
+    &mdash; Outstanding IO: operations issued and not yet completed. Latency multiplied
+    by nothing tells you why it is high -- this does. High latency with high outstanding
+    IO is queueing, high latency with low outstanding IO is a slow device.</p>
+
+    <h3 style="font-size:13px;font-weight:700;margin:16px 0 6px 0;color:#e9edf0;border-bottom:1px
+    solid rgba(255,255,255,0.18);padding-bottom:3px">Per host - component manager</h3>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0">Renders the <b style="font-weight:700;color:#e9edf0">vSAN
+    Host DOM Component Manager</b> view. Metrics under <code style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:#8fd3ff">cptvsan|Storage
+    I/O:dom-compmgr</code> on the vCenter host object (HostSystem).</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Component
+    congestion</span> &mdash; Congestion raised against a single component. Shown
+    beside shared congestion on the same row.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Shared
+    congestion</span> &mdash; Shared congestion, as distinct from congestion raised
+    against a single component.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Resync
+    read congestion</span> &mdash; Congestion attributed to resync reads.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    Lat (μs)</span> &mdash; Average read latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Lat
+    (max, read) (μs)</span> &mdash; Worst read latency in the interval.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    Lat (μs)</span> &mdash; Average write latency at this layer. For the client, component
+    manager and zDOM layers the vSAN Performance Service graph definition marks 15
+    ms as warning and 30 ms as critical; it defines no threshold for the owner layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Lat
+    (max, write) (μs)</span> &mdash; Worst write latency in the interval.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Lat
+    stddev (write) (μs)</span> &mdash; Standard deviation of write latency.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    IOPS</span> &mdash; Read operations per second.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    IOPS</span> &mdash; Write operations per second.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">OIO</span>
+    &mdash; Outstanding IO: operations issued and not yet completed. Latency multiplied
+    by nothing tells you why it is high -- this does. High latency with high outstanding
+    IO is queueing, high latency with low outstanding IO is a slow device.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Read
+    Throughput (B/s)</span> &mdash; Bytes per second read at this layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Write
+    Throughput (B/s)</span> &mdash; Bytes per second written at this layer.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">VM
+    disk queue depth (write)</span> &mdash; Queue depth for virtual disk writes at
+    the component manager.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">VM
+    disk dispatched cost (write) (B/s)</span> &mdash; Cost of dispatched virtual disk
+    writes, as reported by the component manager.</p>
+
+    <p style="margin:5px 0;line-height:1.45;color:#e9edf0"><span style="font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8fd3ff">Namespace
+    dispatched cost (write) (B/s)</span> &mdash; Cost of dispatched writes to namespace
+    objects, which hold VM configuration files, as reported by the component manager.</p>
+
+    </div>'
+interactions:
+- from: ab2fd9ac-12e5-596c-b3df-19db870b511c
+  to: 28b2ca1c-4cf4-5d7f-9b8b-6fb8504f5282
+  type: resourceId
+- from: ab2fd9ac-12e5-596c-b3df-19db870b511c
+  to: 0d6665e3-696b-5f5a-9400-bb6a4c1e80e2
+  type: resourceId
+- from: ab2fd9ac-12e5-596c-b3df-19db870b511c
+  to: dae3d599-046a-564b-99f3-4898af181a51
+  type: resourceId
+- from: ab2fd9ac-12e5-596c-b3df-19db870b511c
+  to: ac9deec5-eb54-54fd-ac36-bc33151aead6
+  type: resourceId
+- from: ab2fd9ac-12e5-596c-b3df-19db870b511c
+  to: 290259f5-70f8-5577-a235-24b71f533cdf
+  type: resourceId

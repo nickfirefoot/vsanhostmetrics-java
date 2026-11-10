@@ -1,0 +1,80 @@
+id: cfaac7b8-f794-5658-ade4-1d7d6adf4f91
+name: vSAN vmknic [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- instanced_group:
+    name: GROUP_cptvsan
+  display_name: VMkernel NIC
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: txPacketsLossRate
+    sample_instance: "*"
+  display_name: Out Packet Discard Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: rxPacketsLossRate
+    sample_instance: "*"
+  display_name: In Packet Discard Rate (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: rxThroughput
+    sample_instance: "*"
+  display_name: Throughput In (B/s)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: txThroughput
+    sample_instance: "*"
+  display_name: Throughput Out (B/s)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: rxPackets
+    sample_instance: "*"
+  display_name: In Packets Per Second
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: txPackets
+    sample_instance: "*"
+  display_name: Out Packets Per Second
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: portRxpkts
+    sample_instance: "*"
+  display_name: Port RX packets
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: portTxpkts
+    sample_instance: "*"
+  display_name: Port TX packets (Total)
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: portRxDrops
+    sample_instance: "*"
+  display_name: In Packet Drop Rate (vSwitch port) (%)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|Network|VMkernel NIC
+    suffix: portTxDrops
+    sample_instance: "*"
+  display_name: Out Packet Drop Rate (vSwitch port) (%)
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

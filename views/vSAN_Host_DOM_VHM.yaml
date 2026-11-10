@@ -1,0 +1,27 @@
+id: bf403bc1-f535-5b44-b5d2-219cec8e662d
+name: vSAN Host DOM [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Storage I/O:dom-client|latencyAvgRead
+  display_name: Read Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-client|latencyAvgWrite
+  display_name: Write Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-client|congestion
+  display_name: Congestions
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-client|iopsRead
+  display_name: Read IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-client|iopsWrite
+  display_name: Write IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-client|oio
+  display_name: OIO
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

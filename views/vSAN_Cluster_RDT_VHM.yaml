@@ -1,0 +1,34 @@
+id: c972e782-317e-55b8-b5db-400c703ccfa7
+name: vSAN Cluster RDT [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: ClusterComputeResource
+columns:
+- attribute: cptvsan|Network|RDT|txCtxQMax
+  display_name: Max Out Context Bytes (B)
+  transformation: MAX
+- attribute: cptvsan|Network|RDT|avgLatency
+  display_name: Cluster Avg Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Network|RDT|maxLatency
+  display_name: Cluster Max Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Network|RDT|minLatency
+  display_name: Cluster Min Lat (μs)
+  transformation: MIN
+- attribute: cptvsan|Network|RDT|txQLatAvg
+  display_name: Avg Out Queueing Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Network|RDT|txSbSpaceMin
+  display_name: Socket Min Out Bytes (Low Is Bad) (B)
+  transformation: MIN
+- attribute: cptvsan|Network|RDT|rxSbSpaceMin
+  display_name: Socket Min In Bytes (Low Is Bad) (B)
+  transformation: MIN
+- attribute: cptvsan|Network|RDT|kaReset
+  display_name: Keepalive reset (Total)
+- attribute: cptvsan|Network|RDT|numReadyDelay
+  display_name: Num ready delay (Total)
+time_window:
+  unit: DAYS
+  count: 7

@@ -1,0 +1,65 @@
+# Pak metadata for vSAN Host Metrics 3.0.0 (Java GENERAL adapter).
+#
+# adapter_kind must equal the AdapterKind key in describe.xml and ADAPTER_KIND in
+# VsanHostMetricsAdapter.java. It is the Python pack's key on purpose, so that
+# pack's dashboards and views keep working.
+adapter_kind: vsanhostmetrics
+entry_class: com.cptvsan.adapter.VsanHostMetricsAdapter
+name: vSAN Host Metrics
+description: >
+  vSAN Performance Service metrics from one vCenter, over the vSphere JSON API
+  (vCenter 8.0 Update 3 or later, or 9.0 or later), pushed under cptvsan| onto the
+  VMWARE ClusterComputeResource, HostSystem and VirtualMachine objects the vCenter
+  adapter already owns. It creates no object but its adapter instance and never
+  adds, removes or replaces a relationship on any object.
+version: 3.0.0
+build_number: 1
+tier: 2
+released: false
+
+# Dashboards/views carried over from the Python pack; they target VMWARE
+# objects and keep their original (unprefixed) names.
+content_naming: unprefixed
+content_foreign_adapter_kinds: [VMWARE]
+bundled_content:
+  views:
+    - views/vSAN_CMMDS_Network_VHM.yaml
+    - views/vSAN_Cluster_Capacity_VHM.yaml
+    - views/vSAN_Cluster_DOM_Client_VHM.yaml
+    - views/vSAN_Cluster_DOM_Component_Manager_VHM.yaml
+    - views/vSAN_Cluster_DOM_Owner_VHM.yaml
+    - views/vSAN_Cluster_RDT_VHM.yaml
+    - views/vSAN_Cluster_Resync_Jobs_VHM.yaml
+    - views/vSAN_Cluster_Resync_VHM.yaml
+    - views/vSAN_Clusters_VHM.yaml
+    - views/vSAN_ESA_Disk_Physical_Layer_VHM.yaml
+    - views/vSAN_ESA_Disks_VHM.yaml
+    - views/vSAN_High_pNIC_Error_Rate_VHM.yaml
+    - views/vSAN_Host_CPU_VHM.yaml
+    - views/vSAN_Host_DOM_Component_Manager_VHM.yaml
+    - views/vSAN_Host_DOM_Owner_Scheduler_VHM.yaml
+    - views/vSAN_Host_DOM_Owner_VHM.yaml
+    - views/vSAN_Host_DOM_VHM.yaml
+    - views/vSAN_Host_Memory_VHM.yaml
+    - views/vSAN_Host_Network_VHM.yaml
+    - views/vSAN_Host_TCP_Health_VHM.yaml
+    - views/vSAN_Host_Uplinks_and_Load_VHM.yaml
+    - views/vSAN_RDT_Transport_Per_Host_VHM.yaml
+    - views/vSAN_Segment_Cleaning_Per_Host_VHM.yaml
+    - views/vSAN_VM_Latency_VHM.yaml
+    - views/vSAN_VM_Storage_VHM.yaml
+    - views/vSAN_pNIC_Errors_VHM.yaml
+    - views/vSAN_vmknic_RDT_Latency_VHM.yaml
+    - views/vSAN_vmknic_VHM.yaml
+    - views/vSAN_zDOM_Cluster_VHM.yaml
+    - views/vSAN_zDOM_Per_Host_VHM.yaml
+    - views/vSAN_zDOM_Write_Path_VHM.yaml
+  dashboards:
+    - dashboards/Rapid_vSAN_Backpressure.yaml
+    - dashboards/Rapid_vSAN_DOM.yaml
+    - dashboards/Rapid_vSAN_ESA_Write_Path.yaml
+    - dashboards/Rapid_vSAN_Host_Resources.yaml
+    - dashboards/Rapid_vSAN_Network.yaml
+    - dashboards/Rapid_vSAN_Overview.yaml
+    - dashboards/Rapid_vSAN_Resync.yaml
+    - dashboards/Rapid_vSAN_Storage.yaml

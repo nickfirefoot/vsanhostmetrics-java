@@ -1,0 +1,49 @@
+id: 40c18c38-50d6-5e0c-992f-9fd042d3b4ed
+name: vSAN Cluster Resync Jobs [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: ClusterComputeResource
+columns:
+- attribute: cptvsan|Storage I/O:dom-owner|numPendingResyncJobs
+  display_name: Num pending resync jobs
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numRunningResyncJobs
+  display_name: Num running resync jobs
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numSuspendedResyncJobs
+  display_name: Num suspended resync jobs
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numInflightPriorityResyncJobs
+  display_name: Num inflight priority resync jobs
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numInflightSharedResyncJobs
+  display_name: Num inflight shared resync jobs
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numPendingDecomResyncJobs
+  display_name: Num pending decom resync jobs
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numPendingFullResyncJobs
+  display_name: Num pending full resync jobs
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numRunningFullResyncJobs
+  display_name: Num running full resync jobs
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|avgResyncParallelism
+  display_name: Resync parallelism (average)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numCompleteResyncOps
+  display_name: Num complete resync ops
+- attribute: cptvsan|Storage I/O:dom-owner|numCompleteFullResyncOps
+  display_name: Num complete full resync ops
+- attribute: cptvsan|Storage I/O:dom-owner|iopsResyncRead
+  display_name: Resync Read IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|iopsRecWrite
+  display_name: Recovery Write IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|iopsWrite
+  display_name: Write IOPS
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

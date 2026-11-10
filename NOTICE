@@ -1,0 +1,19 @@
+vSAN Host Metrics management pack (Java adapter)
+Copyright 2026 Nick Wilson
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The build framework comes from sentania-labs/vcf-content-factory-sdk-template
+(MIT License, Copyright (c) Scott Bowe).
+
+Third-party notice: vcf-content-factory-sdk-vsanperf (MIT License)
+
+  VcClient, Inventory, RowSink and VsanFault follow request and response shapes and client
+  behaviour (the /sdk/vim25/<release>/ paths, the vmware-api-session-id header, release id
+  8.0.3.0 with fallback to the server's own, the "_typeName" bodies, the fault body and its
+  wildcardlimit key, "None" for a missing sample) documented by the reference implementation
+  vcf-content-factory-sdk-vsanperf (VsanJsonClient.java, Inventory.java, PerfParser.java,
+  VsanFault.java), Copyright (c) 2026 Scott Bowe <scott.bowe@broadcom.com> <scottb@sentania.net>,
+  MIT License: permission is granted, free of charge, to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the software, subject to this notice being
+  included in all copies or substantial portions. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
+  WARRANTY OF ANY KIND.

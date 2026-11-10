@@ -1,0 +1,12 @@
+id: 057a006b-7ad1-5df7-af19-832b788b7b16
+name: vSAN Clusters [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: ClusterComputeResource
+columns:
+- attribute: config|name
+  display_name: Cluster Name
+  is_property: true
+time_window:
+  unit: DAYS
+  count: 7

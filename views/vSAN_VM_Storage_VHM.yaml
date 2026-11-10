@@ -1,0 +1,40 @@
+id: 24773067-9b6e-536a-a39c-46353dfd5068
+name: vSAN VM Storage [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: VirtualMachine
+columns:
+- instanced_group:
+    name: GROUP_cptvsan
+  display_name: vSCSI Device
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|vSCSI
+    suffix: latencyRead
+    sample_instance: "*"
+  display_name: Read Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|vSCSI
+    suffix: latencyWrite
+    sample_instance: "*"
+  display_name: Write Lat (μs)
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|vSCSI
+    suffix: iopsRead
+    sample_instance: "*"
+  display_name: Read IOPS
+  transformation: MAX
+- instanced_group:
+    name: GROUP_cptvsan
+    prefix: cptvsan|vSCSI
+    suffix: iopsWrite
+    sample_instance: "*"
+  display_name: Write IOPS
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

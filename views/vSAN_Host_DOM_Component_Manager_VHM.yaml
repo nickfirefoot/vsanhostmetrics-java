@@ -1,0 +1,57 @@
+id: 4eccde1c-87f0-5572-9caa-7eb237ec221e
+name: vSAN Host DOM Component Manager [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Storage I/O:dom-compmgr|componentCongestion
+  display_name: Component congestion
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|sharedCongestion
+  display_name: Shared congestion
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|resyncReadCongestion
+  display_name: Resync read congestion
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|latencyAvgRead
+  display_name: Read Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|latencyMaxRead
+  display_name: Lat (max, read) (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|latencyAvgWrite
+  display_name: Write Lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|latencyMaxWrite
+  display_name: Lat (max, write) (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|latencyStddevWrite
+  display_name: Lat stddev (write) (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|iopsRead
+  display_name: Read IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|iopsWrite
+  display_name: Write IOPS
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|oio
+  display_name: OIO
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|throughputRead
+  display_name: Read Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|throughputWrite
+  display_name: Write Throughput (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|vmdiskQueueDepthWrite
+  display_name: VM disk queue depth (write)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|vmdiskDispatchedCostWrite
+  display_name: VM disk dispatched cost (write) (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-compmgr|namespaceDispatchedCostWrite
+  display_name: Namespace dispatched cost (write) (B/s)
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

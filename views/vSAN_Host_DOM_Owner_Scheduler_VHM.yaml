@@ -1,0 +1,39 @@
+id: 2a09900d-2b28-5e7b-bf0c-f0d3ffee3430
+name: vSAN Host DOM Owner Scheduler [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedRollingAvgLatUs
+  display_name: Shaping rolling avg lat (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedGuestLTLatUs
+  display_name: Shaping guest lt latency (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedLowBandThreshUs
+  display_name: Shaping low band thresh (μs)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedLowBand
+  display_name: Shaping low band
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedMidBand
+  display_name: Shaping mid band
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedLowBandSec
+  display_name: Shaping low band sec (s)
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedMidBandSec
+  display_name: Shaping mid band sec (s)
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedLowToMidBand
+  display_name: Shaping low to mid band
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedMidToLowBand
+  display_name: Shaping mid to low band
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedSeenTotalTpBps
+  display_name: Shaping seen total tp (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedSeenNonResyncTpBps
+  display_name: Shaping seen non resync tp (B/s)
+  transformation: MAX
+- attribute: cptvsan|Storage I/O:dom-owner|numNetSchedControllerIopsLimit
+  display_name: Shaping controller IOPS limit
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7

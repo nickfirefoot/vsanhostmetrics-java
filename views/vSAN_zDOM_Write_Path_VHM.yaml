@@ -1,0 +1,39 @@
+id: 66c1bc8a-59d4-548c-bce9-41eea8ec2440
+name: vSAN zDOM Write Path [VHM]
+subject:
+  adapter_kind: VMWARE
+  resource_kind: HostSystem
+columns:
+- attribute: cptvsan|zDOM|maxDiscUsedPct
+  display_name: Disc used % (max)
+  transformation: MAX
+- attribute: cptvsan|zDOM|latAvgTotalOpIO
+  display_name: Lat avg total op IO (μs)
+  transformation: MAX
+- attribute: cptvsan|zDOM|latAvgTxnBank
+  display_name: Lat avg transaction bank (μs)
+  transformation: MAX
+- attribute: cptvsan|zDOM|rateTotalCacheRef
+  display_name: Cache ref (rate, total)
+  transformation: MAX
+- attribute: cptvsan|zDOM|rateBankFlushTotalCacheRef
+  display_name: Bank flush total cache ref (rate)
+  transformation: MAX
+- attribute: cptvsan|zDOM|rateSegCleaningCtxDataTotalCacheRef
+  display_name: Seg clean context data total cache ref (rate)
+  transformation: MAX
+- attribute: cptvsan|zDOM|rateTxnPrefetchTotalCacheRef
+  display_name: Transaction prefetch total cache ref (rate)
+  transformation: MAX
+- attribute: cptvsan|zDOM|rateTxnLookupCacheRef
+  display_name: Transaction lookup cache ref (rate)
+  transformation: MAX
+- attribute: cptvsan|zDOM|rateTxnReadWrite
+  display_name: Transaction (read, write, rate)
+  transformation: MAX
+- attribute: cptvsan|zDOM|checkpointWorkerWakeupMs
+  display_name: Checkpoint worker wakeup ms
+  transformation: MAX
+time_window:
+  unit: DAYS
+  count: 7
