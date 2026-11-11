@@ -12,7 +12,7 @@ description: >
   VMWARE ClusterComputeResource, HostSystem and VirtualMachine objects the vCenter
   adapter already owns. It creates no object but its adapter instance and never
   adds, removes or replaces a relationship on any object.
-version: 3.0.0
+version: 3.0.1
 build_number: 1
 tier: 2
 released: false

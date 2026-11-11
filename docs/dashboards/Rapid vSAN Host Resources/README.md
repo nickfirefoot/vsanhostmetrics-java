@@ -95,3 +95,15 @@ Renders the **vSAN Host Network** view. Metrics under `cptvsan|Network|Host` on 
 **`Network In Packets Per Second`** — Inbound packets per second.
 
 **`Network Out Packets Per Second`** — Outbound packets per second.
+
+## Complete the install
+
+![Complete the install box](../complete-the-install.png)
+
+1. Go to Administration → Integrations → **Accounts** tab → **ADD** → choose the **vSAN Host Metrics** tile.
+2. Fill in **Add Account - vSAN Host Metrics**: **Name**; **vCenter Server**; **vCenter username**; **Credential** → **+** → **Credential name** and **vCenter password** → **OK**; **Verify vCenter certificate**; **Cloud Proxy / Group** (9.1.1) or **Collector / Group** (8.18). The vCenter port is under **Advanced Settings** (default 443).
+3. Click **VALIDATE CONNECTION** and accept the vCenter certificate when prompted. Then click **ADD**.
+4. **After installing or upgrading the pak:** Administration → Integrations → Accounts → expand **vSAN Host Metrics** → check the account's **Status**. If it isn't collecting, use ⋮ on the account row → **Start Collecting**.
+5. **Requirements:** vCenter 8.0 U3 or later, or 9.0 or later; a vCenter account that can read vSAN performance data.
+
+No policy or super-metric changes are needed.

@@ -342,6 +342,25 @@ widgets:
     objects, which hold VM configuration files, as reported by the component manager.</p>
 
     </div>'
+- id: 6a0f4d84-a09d-52f6-a0db-749db6ab6443
+  type: TextDisplay
+  title: Complete the install
+  coords:
+    x: 1
+    y: 46
+    w: 12
+    h: 9
+  html: '<div style="font-family:''Metropolis'',''Segoe UI'',sans-serif;font-size:13px;line-height:1.45;padding:12px 14px;background:#2b3137;color:#e9edf0;border-radius:6px;border:1px solid #4a535d">
+<h3 style="font-size:15px;margin:4px 0 10px 0;color:#ffffff">Complete the install</h3>
+<ol style="margin:4px 0 4px 20px;padding:0;color:#e9edf0">
+<li style="margin:5px 0;line-height:1.45;color:#e9edf0">Go to Administration &rarr; Integrations &rarr; <b style="font-weight:700;color:#ffffff">Accounts</b> tab &rarr; <b style="font-weight:700;color:#ffffff">ADD</b> &rarr; choose the <b style="font-weight:700;color:#ffffff">vSAN Host Metrics</b> tile.</li>
+<li style="margin:5px 0;line-height:1.45;color:#e9edf0">Fill in <b style="font-weight:700;color:#ffffff">Add Account - vSAN Host Metrics</b>: <b style="font-weight:700;color:#ffffff">Name</b>; <b style="font-weight:700;color:#ffffff">vCenter Server</b>; <b style="font-weight:700;color:#ffffff">vCenter username</b>; <b style="font-weight:700;color:#ffffff">Credential</b> &rarr; <b style="font-weight:700;color:#ffffff">+</b> &rarr; <b style="font-weight:700;color:#ffffff">Credential name</b> and <b style="font-weight:700;color:#ffffff">vCenter password</b> &rarr; <b style="font-weight:700;color:#ffffff">OK</b>; <b style="font-weight:700;color:#ffffff">Verify vCenter certificate</b>; <b style="font-weight:700;color:#ffffff">Cloud Proxy / Group</b> (9.1.1) or <b style="font-weight:700;color:#ffffff">Collector / Group</b> (8.18). The vCenter port is under <b style="font-weight:700;color:#ffffff">Advanced Settings</b> (default 443).</li>
+<li style="margin:5px 0;line-height:1.45;color:#e9edf0">Click <b style="font-weight:700;color:#ffffff">VALIDATE CONNECTION</b> and accept the vCenter certificate when prompted. Then click <b style="font-weight:700;color:#ffffff">ADD</b>.</li>
+<li style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#ffd79a">After installing or upgrading the pak:</b> Administration &rarr; Integrations &rarr; Accounts &rarr; expand <b style="font-weight:700;color:#ffffff">vSAN Host Metrics</b> &rarr; check the account''s <b style="font-weight:700;color:#ffffff">Status</b>. If it isn''t collecting, use &#8942; on the account row &rarr; <b style="font-weight:700;color:#ffffff">Start Collecting</b>.</li>
+<li style="margin:5px 0;line-height:1.45;color:#e9edf0"><b style="font-weight:700;color:#ffffff">Requirements:</b> vCenter 8.0 U3 or later, or 9.0 or later; a vCenter account that can read vSAN performance data.</li>
+</ol>
+<p style="margin:5px 0;line-height:1.45;color:#e9edf0">No policy or super-metric changes are needed.</p>
+</div>'
 interactions:
 - from: 5f889755-af17-5fef-9934-968e0274525f
   to: cfe36c11-2df9-5ea9-a316-00f8b6e34706

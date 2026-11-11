@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.0.1
+
+- Every dashboard ends with a "Complete the install" box: where to add the account, what to fill in,
+  how to restart collection after an upgrade (account row menu, Start Collecting), and the
+  requirements. The same text is in each dashboard's README, with a screenshot.
+- The generated inventory docs no longer say "No traversal spec found" / "Resource kinds: 0".
+  `tools/fix_generated_docs.py` rewrites them after each build as "Where the data lives" (the pack
+  creates only its adapter instance; its metrics are pushed onto vCenter's own cluster, host and
+  virtual machine objects). The `.excalidraw` file is removed, and `ci/verify.sh` fails if the old
+  wording returns. No adapter code, metric or view changes.
+
 ## 3.0.0
 
 - build 1: the earlier Python pack (2.x) as a Java GENERAL adapter. JSON API only (vCenter 8.0 U3+/9.0+),

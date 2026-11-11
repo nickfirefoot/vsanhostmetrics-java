@@ -1,4 +1,4 @@
-# vSAN Host Metrics 3.0.0
+# vSAN Host Metrics 3.0.1
 
 A VCF Operations management pack (Tier 2, Java adapter) that collects vSAN Performance Service
 metrics from one vCenter over the vSphere JSON API and pushes them onto the cluster, host and
@@ -29,7 +29,7 @@ adapter instance, which carries `Collector|*` self-metrics.
 
 ## Install
 
-1. Download [`vsanhostmetrics-3.0.0.pak`](https://github.com/nickfirefoot/vsanhostmetrics-java/raw/main/paks/vsanhostmetrics-3.0.0.pak) from the `paks/` directory of this repository (SHA-256 in `paks/SHA256SUMS`).
+1. Download [`vsanhostmetrics-3.0.1.pak`](https://github.com/nickfirefoot/vsanhostmetrics-java/raw/main/paks/vsanhostmetrics-3.0.1.pak) from the `paks/` directory of this repository (SHA-256 in `paks/SHA256SUMS`).
 2. In VCF Operations go to **Administration > Integrations > Repository > Add**, upload the pak
    and accept that it is unsigned.
 3. Add an account (**Integrations > Accounts > Add Account > vSAN Host Metrics**) with:
@@ -80,8 +80,19 @@ For a release, add `--release` (the factory then stamps the `adapter.yaml` versi
 the pak against a reference pak), then stamp the vendor and licence:
 
 ```sh
-python3 tools/finalize_pak.py <dir>/vcfcf_sdk_vsanhostmetrics.3.0.0.1.pak vsanhostmetrics-3.0.0.pak
+python3 tools/fix_generated_docs.py     # after every build, see below
+python3 tools/finalize_pak.py <dir>/vcfcf_sdk_vsanhostmetrics.3.0.1.1.pak vsanhostmetrics-3.0.1.pak
 ```
+
+The build regenerates `docs/inventory-tree.*` and `docs/README.md` from `describe.xml`. This pack
+creates no resource kinds, so that output says "No traversal spec found" and "Resource kinds: 0",
+which is misleading: the data lives on vCenter's own objects. **Run `python3 tools/fix_generated_docs.py`
+after each build**; it rewrites those files as a "Where the data lives" page and deletes the
+`.excalidraw` file. `ci/verify.sh` fails if "No traversal spec found" is still anywhere under `docs/`.
+
+The "Complete the install" box on every dashboard (and in each dashboard README) comes from
+`tools/install_box.py`; edit the text there, run it, and `ci/verify.sh` checks nothing has drifted.
+`tools/test_install_box_contrast.py <pak>` measures its colours inside a built pak.
 
 Checks (generated files current, relationship gate, unit tests):
 
