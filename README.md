@@ -55,6 +55,7 @@ Metrics and properties are named `cptvsan|<group>[:<instance>]|<metric>` and lan
 The full key list is in [REFERENCE.md](REFERENCE.md). The pack ships 8 dashboards and 31 views:
 Rapid vSAN Overview, Storage, Network, DOM, ESA Write Path, Backpressure, Resync and Host
 Resources.
+Per-dashboard documentation with screenshots is in [docs/dashboards](docs/dashboards/README.md).
 
 Collection behaviour: inventory is read with `WaitForUpdatesEx` on a private PropertyCollector;
 a set of 13 heavy entity types is rotated over 3 buckets; types that return no entity are
