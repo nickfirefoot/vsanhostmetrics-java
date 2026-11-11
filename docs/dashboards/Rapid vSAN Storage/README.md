@@ -5,11 +5,11 @@
 ## Widgets
 
 - **Select cluster**: lists the clusters; the selected cluster drives every other widget.
-- **ESA disks - vSAN layer**: the *vSAN ESA Disks* view, one row per host; 6 columns, including Disk UUID, vSAN Layer Avg Read Lat, vSAN Layer Avg Write Lat, Perf Tier Avg Write Lat, and more.
-- **ESA disks - physical layer**: the *vSAN ESA Disk Physical Layer* view, one row per host; 10 columns, including Disk UUID, Model, Firmware, Driver, and more.
+- **ESA disks - vSAN layer**: the *vSAN ESA Disks* view, one row per ESA disk; 6 columns, including Disk UUID, vSAN Layer Avg Read Lat, vSAN Layer Avg Write Lat, Perf Tier Avg Write Lat, and more.
+- **ESA disks - physical layer**: the *vSAN ESA Disk Physical Layer* view, one row per ESA disk; 10 columns, including Disk UUID, Model, Firmware, Driver, and more.
 - **Back end - per host**: the *vSAN Host DOM Component Manager* view, one row per host; 16 columns, including Component congestion, Shared congestion, Resync read congestion, Read Lat (μs), and more.
 - **Capacity**: the *vSAN Cluster Capacity* view, one row per cluster; 5 columns, including Free Capacity (B), Used Capacity (B), Total Capacity (B), Space Efficiency Ratio (100 = 1.00x), and more.
-- **VM storage - per controller**: the *vSAN VM Storage* view, one row per virtual machine; 5 columns, including vSCSI Device, Read Lat (μs), Write Lat (μs), Read IOPS, and more.
+- **VM storage - per controller**: the *vSAN VM Storage* view, one row per VM vSCSI controller; 5 columns, including vSCSI Device, Read Lat (μs), Write Lat (μs), Read IOPS, and more.
 - **VM latency - per VM**: the *vSAN VM Latency* view, one row per virtual machine; 6 columns, including Read Lat (μs), Write Lat (μs), Read IOPS, Write IOPS, and more.
 - **How to read this**: the help text box, reproduced below.
 

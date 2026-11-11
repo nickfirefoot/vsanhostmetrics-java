@@ -5,11 +5,11 @@
 ## Widgets
 
 - **Select cluster**: lists the clusters; the selected cluster drives every other widget.
-- **RDT latencies - per vmknic**: the *vSAN vmknic RDT Latency* view, one row per host; 11 columns, including VMkernel NIC, Max Out Context Bytes (B), VNIC Avg Lat (μs), Cluster Max Lat (μs), and more.
-- **TCP error types**: the *vSAN Host TCP Health* view, one row per host; 13 columns, including TCP/IP Stack, TCP TX retransmit (rate), TCP RX errors (rate), Received Duplicate Acknowledge Rate (%), and more.
-- **vmknic - the kernel port**: the *vSAN vmknic* view, one row per host; 11 columns, including VMkernel NIC, Out Packet Discard Rate (%), In Packet Discard Rate (%), Throughput In (B/s), and more.
-- **High pNIC error rate**: the *vSAN High pNIC Error Rate* view, one row per host; 10 columns, including Physical NIC, pNIC RX CRC Error (%), pNIC RX Generic Error (%), pNIC RX FIFO Error (%), and more.
-- **pNIC stats - every counter**: the *vSAN pNIC Errors* view, one row per host; 18 columns, including Physical NIC, pNIC RX Missed Error (%), pNIC RX CRC Error (%), pNIC RX Generic Error (%), and more.
+- **RDT latencies - per vmknic**: the *vSAN vmknic RDT Latency* view, one row per VMkernel NIC; 11 columns, including VMkernel NIC, Max Out Context Bytes (B), VNIC Avg Lat (μs), Cluster Max Lat (μs), and more.
+- **TCP error types**: the *vSAN Host TCP Health* view, one row per host TCP/IP stack; 13 columns, including TCP/IP Stack, TCP TX retransmit (rate), TCP RX errors (rate), Received Duplicate Acknowledge Rate (%), and more.
+- **vmknic - the kernel port**: the *vSAN vmknic* view, one row per VMkernel NIC; 11 columns, including VMkernel NIC, Out Packet Discard Rate (%), In Packet Discard Rate (%), Throughput In (B/s), and more.
+- **High pNIC error rate**: the *vSAN High pNIC Error Rate* view, one row per physical NIC; 10 columns, including Physical NIC, pNIC RX CRC Error (%), pNIC RX Generic Error (%), pNIC RX FIFO Error (%), and more.
+- **pNIC stats - every counter**: the *vSAN pNIC Errors* view, one row per physical NIC; 18 columns, including Physical NIC, pNIC RX Missed Error (%), pNIC RX CRC Error (%), pNIC RX Generic Error (%), and more.
 - **Every uplink - from vCenter**: the *vSAN Host Uplinks and Load* view, one row per host; 13 columns, including Uplink RX Errors, All NICs, Uplink RX Dropped, All NICs, Uplink TX Errors, All NICs, Uplink TX Dropped, All NICs, and more.
 - **CMMDS - cluster membership**: the *vSAN CMMDS Network* view, one row per host; 10 columns, including Read Out, Read In, Read Out Throughput (B/s), Read In Throughput (B/s), and more.
 - **How to read this**: the help text box, reproduced below.
